@@ -45,7 +45,7 @@ const state = {
   selectedTrackId: 'all',
   selectedSessionId: 'all',
   searchQuery: '',
-  sortBy: 'latest', // 'latest', 'likes', 'oldest'
+  sortBy: 'latest', // 'latest', 'student_id', 'likes', 'oldest'
   
   // 모달 상태
   isFormModalOpen: false,
@@ -67,6 +67,7 @@ const state = {
   adminTab: 'logs', // 'logs', 'template', 'tracks', 'sessions', 'supabase'
   adminLogFilterTrack: 'all',
   adminLogFilterSession: 'all',
+  adminLogSort: 'latest', // 'latest', 'student_id', 'name', 'likes', 'oldest'
   adminLogSearch: '',
   
   // Supabase 상태
@@ -405,6 +406,7 @@ function renderSessionFilter() {
         <!-- Sort Select -->
         <select id="sort-select" class="px-2.5 py-1.5 text-xs sm:text-sm bg-slate-50 border border-slate-200 rounded-xl font-medium text-slate-700 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
           <option value="latest" ${state.sortBy === 'latest' ? 'selected' : ''}>최신 등록순</option>
+          <option value="student_id" ${state.sortBy === 'student_id' ? 'selected' : ''}>학번순 (오름차순)</option>
           <option value="likes" ${state.sortBy === 'likes' ? 'selected' : ''}>공감 많은순</option>
           <option value="oldest" ${state.sortBy === 'oldest' ? 'selected' : ''}>오래된순</option>
         </select>
@@ -450,6 +452,24 @@ function renderFeed() {
   // 정렬 적용
   if (state.sortBy === 'latest') {
     filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  } else if (state.sortBy === 'student_id') {
+    filtered.sort((a, b) => {
+      const idA = (a.student_info?.student_id || '').toString().trim();
+      const idB = (b.student_info?.student_id || '').toString().trim();
+      if (idA && idB) {
+        const cmp = idA.localeCompare(idB, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmp !== 0) return cmp;
+      } else if (idA) {
+        return -1;
+      } else if (idB) {
+        return 1;
+      }
+      const nameA = (a.student_info?.name || '').toString().trim();
+      const nameB = (b.student_info?.name || '').toString().trim();
+      const nameCmp = nameA.localeCompare(nameB, 'ko');
+      if (nameCmp !== 0) return nameCmp;
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
   } else if (state.sortBy === 'likes') {
     filtered.sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0));
   } else if (state.sortBy === 'oldest') {
@@ -1263,6 +1283,34 @@ function renderAdminLogsTab() {
     });
   }
 
+  // 관리자 일지 정렬 적용
+  if (state.adminLogSort === 'latest') {
+    filteredLogs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  } else if (state.adminLogSort === 'student_id') {
+    filteredLogs.sort((a, b) => {
+      const idA = (a.student_info?.student_id || '').toString().trim();
+      const idB = (b.student_info?.student_id || '').toString().trim();
+      if (idA && idB) {
+        const cmp = idA.localeCompare(idB, undefined, { numeric: true, sensitivity: 'base' });
+        if (cmp !== 0) return cmp;
+      } else if (idA) return -1;
+      else if (idB) return 1;
+      const nameA = (a.student_info?.name || '').toString().trim();
+      const nameB = (b.student_info?.name || '').toString().trim();
+      return nameA.localeCompare(nameB, 'ko');
+    });
+  } else if (state.adminLogSort === 'name') {
+    filteredLogs.sort((a, b) => {
+      const nameA = (a.student_info?.name || '').toString().trim();
+      const nameB = (b.student_info?.name || '').toString().trim();
+      return nameA.localeCompare(nameB, 'ko');
+    });
+  } else if (state.adminLogSort === 'likes') {
+    filteredLogs.sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0));
+  } else if (state.adminLogSort === 'oldest') {
+    filteredLogs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  }
+
   return `
     <div class="space-y-6">
       
@@ -1297,7 +1345,7 @@ function renderAdminLogsTab() {
         <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-3 border-t border-slate-100">
           
           <!-- Career Track Filter -->
-          <div class="sm:col-span-4">
+          <div class="sm:col-span-3">
             <label class="block text-xs font-semibold text-slate-600 mb-1">진로 계열 필터</label>
             <select id="admin-filter-track-select" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
               <option value="all" ${state.adminLogFilterTrack === 'all' ? 'selected' : ''}>전체 진로 계열</option>
@@ -1308,7 +1356,7 @@ function renderAdminLogsTab() {
           </div>
 
           <!-- Session Filter -->
-          <div class="sm:col-span-4">
+          <div class="sm:col-span-3">
             <label class="block text-xs font-semibold text-slate-600 mb-1">활동 차시 필터</label>
             <select id="admin-filter-session-select" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
               <option value="all" ${state.adminLogFilterSession === 'all' ? 'selected' : ''}>전체 활동 차시</option>
@@ -1318,8 +1366,20 @@ function renderAdminLogsTab() {
             </select>
           </div>
 
+          <!-- Sort Filter -->
+          <div class="sm:col-span-3">
+            <label class="block text-xs font-semibold text-slate-600 mb-1">정렬 기준</label>
+            <select id="admin-filter-sort-select" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
+              <option value="latest" ${state.adminLogSort === 'latest' ? 'selected' : ''}>최신 등록순</option>
+              <option value="student_id" ${state.adminLogSort === 'student_id' ? 'selected' : ''}>학번순 (오름차순)</option>
+              <option value="name" ${state.adminLogSort === 'name' ? 'selected' : ''}>학생 이름순</option>
+              <option value="likes" ${state.adminLogSort === 'likes' ? 'selected' : ''}>공감 많은순</option>
+              <option value="oldest" ${state.adminLogSort === 'oldest' ? 'selected' : ''}>오래된순</option>
+            </select>
+          </div>
+
           <!-- Search Keyword -->
-          <div class="sm:col-span-4">
+          <div class="sm:col-span-3">
             <label class="block text-xs font-semibold text-slate-600 mb-1">학생명 / 학번 / 도서명 검색</label>
             <div class="relative">
               <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
@@ -2473,6 +2533,14 @@ function bindAdminModalEvents() {
     };
   }
 
+  const sortFilterSelect = document.getElementById('admin-filter-sort-select');
+  if (sortFilterSelect) {
+    sortFilterSelect.onchange = e => {
+      state.adminLogSort = e.target.value;
+      renderAdminModal();
+    };
+  }
+
   const searchInput = document.getElementById('admin-filter-search-input');
   if (searchInput) {
     searchInput.oninput = e => {
@@ -2540,6 +2608,34 @@ function bindAdminModalEvents() {
           const studentId = (l.student_info?.student_id || '').toLowerCase();
           return book.includes(q) || author.includes(q) || name.includes(q) || studentId.includes(q);
         });
+      }
+
+      // 정렬 적용
+      if (state.adminLogSort === 'latest') {
+        filteredLogs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      } else if (state.adminLogSort === 'student_id') {
+        filteredLogs.sort((a, b) => {
+          const idA = (a.student_info?.student_id || '').toString().trim();
+          const idB = (b.student_info?.student_id || '').toString().trim();
+          if (idA && idB) {
+            const cmp = idA.localeCompare(idB, undefined, { numeric: true, sensitivity: 'base' });
+            if (cmp !== 0) return cmp;
+          } else if (idA) return -1;
+          else if (idB) return 1;
+          const nameA = (a.student_info?.name || '').toString().trim();
+          const nameB = (b.student_info?.name || '').toString().trim();
+          return nameA.localeCompare(nameB, 'ko');
+        });
+      } else if (state.adminLogSort === 'name') {
+        filteredLogs.sort((a, b) => {
+          const nameA = (a.student_info?.name || '').toString().trim();
+          const nameB = (b.student_info?.name || '').toString().trim();
+          return nameA.localeCompare(nameB, 'ko');
+        });
+      } else if (state.adminLogSort === 'likes') {
+        filteredLogs.sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0));
+      } else if (state.adminLogSort === 'oldest') {
+        filteredLogs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
       }
 
       const trackMap = new Map(state.tracks.map(t => [t.id, t.name]));
