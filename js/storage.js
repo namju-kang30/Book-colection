@@ -372,6 +372,13 @@ export async function createReadingLog(logData) {
     }
   }
 
+  // Fallback to local storage
+  const allLogs = await getAllLogsFromLocal();
+  const updated = [newLog, ...allLogs];
+  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
+  return newLog;
+}
+
 export async function updateReadingLog(id, updates) {
   const supabase = getSupabaseClient();
   if (supabase) {
