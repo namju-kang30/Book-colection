@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS reading_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     track_id UUID REFERENCES career_tracks(id) ON DELETE SET NULL,
     session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    student_info JSONB NOT NULL, -- {"student_id": "20315", "name": "김하은"}
+    student_info JSONB NOT NULL, -- {"student_id": "20315", "name": "김하은", "password_hash": "..."}
     content JSONB NOT NULL,      -- {"field_book": "코스모스", "field_author": "칼 세이건", ...}
     likes_count INT DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -95,45 +95,58 @@ CREATE POLICY "Allow public delete reading_logs" ON reading_logs FOR DELETE USIN
 
 -- 7. 실시간(Realtime) 복제 활성화
 BEGIN;
-  -- supabase_realtime publication에 테이블 추가
-  ALTER PUBLICATION supabase_realtime ADD TABLE career_tracks;
-  ALTER PUBLICATION supabase_realtime ADD TABLE sessions;
-  ALTER PUBLICATION supabase_realtime ADD TABLE journal_templates;
-  ALTER PUBLICATION supabase_realtime ADD TABLE reading_logs;
+  -- supabase_realtime publication에 테이블 추가 (이미 추가된 경우 무시)
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'career_tracks') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE career_tracks;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'sessions') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE sessions;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'journal_templates') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE journal_templates;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND tablename = 'reading_logs') THEN
+      ALTER PUBLICATION supabase_realtime ADD TABLE reading_logs;
+    END IF;
+  END $$;
 COMMIT;
 
--- 8. 초기 기본 데이터 삽입
-INSERT INTO career_tracks (name, color, icon, order_num)
+-- 8. 초기 기본 데이터 삽입 (고정 UUID 적용으로 프론트엔드와 100% 일치)
+INSERT INTO career_tracks (id, name, color, icon, order_num)
 VALUES 
-    ('자연과학', '#059669', 'Atom', 1),
-    ('공학·IT', '#2563EB', 'Cpu', 2),
-    ('인문·사회', '#D97706', 'BookOpen', 3),
-    ('의약·보건', '#E11D48', 'Activity', 4),
-    ('교육·사범', '#7C3AED', 'GraduationCap', 5),
-    ('경영·경제', '#0891B2', 'TrendingUp', 6),
-    ('예술·체육', '#DB2777', 'Palette', 7),
-    ('융합·자율', '#4F46E5', 'Compass', 8)
-ON CONFLICT DO NOTHING;
+    ('11111111-0001-4000-8000-000000000001', '자연과학', '#059669', 'Atom', 1),
+    ('11111111-0002-4000-8000-000000000002', '공학·IT', '#2563EB', 'Cpu', 2),
+    ('11111111-0003-4000-8000-000000000003', '인문·사회', '#D97706', 'BookOpen', 3),
+    ('11111111-0004-4000-8000-000000000004', '의약·보건', '#E11D48', 'Activity', 4),
+    ('11111111-0005-4000-8000-000000000005', '교육·사범', '#7C3AED', 'GraduationCap', 5),
+    ('11111111-0006-4000-8000-000000000006', '경영·경제', '#0891B2', 'TrendingUp', 6),
+    ('11111111-0007-4000-8000-000000000007', '예술·체육', '#DB2777', 'Palette', 7),
+    ('11111111-0008-4000-8000-000000000008', '융합·자율', '#4F46E5', 'Compass', 8)
+ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO sessions (title, date, is_active)
+INSERT INTO sessions (id, title, date, is_active)
 VALUES 
-    ('1차시 : 진로 탐색 독서', CURRENT_DATE - INTERVAL '14 days', TRUE),
-    ('2차시 : 심화 전공 독서', CURRENT_DATE - INTERVAL '7 days', TRUE),
-    ('3차시 : 융합 독서 및 나눔', CURRENT_DATE, TRUE),
-    ('4차시 : 진로 독서 포트폴리오', CURRENT_DATE + INTERVAL '7 days', FALSE)
-ON CONFLICT DO NOTHING;
+    ('22222222-0001-4000-8000-000000000001', '1차시 : 진로 탐색 및 핵심 도서 선정', '2026-03-10', TRUE),
+    ('22222222-0002-4000-8000-000000000002', '2차시 : 심화 쟁점 분석 및 비판적 읽기', '2026-03-24', TRUE),
+    ('22222222-0003-4000-8000-000000000003', '3차시 : 진로 융합 탐구 및 인사이트 나눔', '2026-04-07', TRUE),
+    ('22222222-0004-4000-8000-000000000004', '4차시 : 독서 연계 주제 탐구 포트폴리오', '2026-04-21', FALSE)
+ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO journal_templates (title, fields, is_active)
+INSERT INTO journal_templates (id, title, fields, is_active)
 VALUES (
+    '33333333-0001-4000-8000-000000000001',
     '표준 독서 활동 일지 양식',
     '[
         {"id": "field_book", "label": "도서명", "type": "text", "required": true, "placeholder": "예: 부분과 전체, 사피엔스, 멋진 신세계 등"},
         {"id": "field_author", "label": "저자 / 역자 / 출판사", "type": "text", "required": true, "placeholder": "예: 베르너 하이젠베르크 / 지식산업사"},
-        {"id": "field_pages", "label": "읽은 범위 / 페이지", "type": "text", "required": false, "placeholder": "예: 120p ~ 245p 또는 완독"},
-        {"id": "field_quote", "label": "가장 인상 깊었던 구절 및 선정한 이유", "type": "textarea", "required": true, "placeholder": "마음에 와닿거나 새로운 시각을 준 문장을 인용하고, 그 이유를 적어주세요."},
-        {"id": "field_career", "label": "나의 진로와의 연계점 및 느낀 점 (실천 계획)", "type": "textarea", "required": true, "placeholder": "이 책을 읽고 희망 진로 분야에서 어떤 영감을 얻었는지, 앞으로의 탐구 또는 실천 계획을 서술해 주세요."},
+        {"id": "field_pages", "label": "읽은 범위 / 쪽수", "type": "text", "required": false, "placeholder": "예: 120p ~ 245p 또는 전체 완독"},
+        {"id": "field_quote", "label": "가장 인상 깊었던 구절 및 선정한 이유", "type": "textarea", "required": true, "placeholder": "마음에 와닿거나 새로운 시각을 준 핵심 문장을 인용하고, 그 이유를 적어주세요."},
+        {"id": "field_career", "label": "나의 진로와의 연계점 및 느낀 점 (실천 계획)", "type": "textarea", "required": true, "placeholder": "이 책을 읽고 희망 진로 분야에서 어떤 영감을 얻었는지, 앞으로의 심화 탐구 또는 실천 계획을 서술해 주세요."},
+        {"id": "field_keywords", "label": "핵심 키워드 (쉼표로 구분)", "type": "text", "required": false, "placeholder": "예: 양자역학, 불확정성원리, 과학철학"},
         {"id": "field_rating", "label": "이 책에 대한 나의 추천 별점", "type": "rating", "required": false, "placeholder": "5점 만점"}
     ]'::jsonb,
     TRUE
 )
-ON CONFLICT DO NOTHING;
+ON CONFLICT (id) DO NOTHING;

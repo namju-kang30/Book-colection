@@ -1767,7 +1767,10 @@ function renderAdminSupabaseTab() {
           </button>
         </div>
 
-        <pre class="p-4 rounded-xl bg-slate-900 text-slate-200 text-xs font-mono overflow-x-auto max-h-60 leading-relaxed border border-slate-800 select-all" id="sql-schema-code">-- 1. 진로 계열 테이블
+        <pre class="p-4 rounded-xl bg-slate-900 text-slate-200 text-xs font-mono overflow-x-auto max-h-60 leading-relaxed border border-slate-800 select-all" id="sql-schema-code">-- 1. 확장 기능 활성화
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 2. 진로 계열 테이블
 CREATE TABLE IF NOT EXISTS career_tracks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
@@ -1777,7 +1780,7 @@ CREATE TABLE IF NOT EXISTS career_tracks (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 2. 활동 차시 테이블
+-- 3. 활동 차시 테이블
 CREATE TABLE IF NOT EXISTS sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title TEXT NOT NULL,
@@ -1786,7 +1789,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. 독서 일지 공통 양식 테이블
+-- 4. 독서 일지 공통 양식 테이블
 CREATE TABLE IF NOT EXISTS journal_templates (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title TEXT NOT NULL DEFAULT '표준 독서 활동 일지 양식',
@@ -1795,7 +1798,7 @@ CREATE TABLE IF NOT EXISTS journal_templates (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 4. 학생 독서 일지 테이블
+-- 5. 학생 독서 일지 테이블
 CREATE TABLE IF NOT EXISTS reading_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     track_id UUID REFERENCES career_tracks(id) ON DELETE SET NULL,
@@ -1806,16 +1809,42 @@ CREATE TABLE IF NOT EXISTS reading_logs (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 5. RLS 공개 정책 설정
+-- 6. RLS 공개 정책 설정
 ALTER TABLE career_tracks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE journal_templates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reading_logs ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Allow public all career_tracks" ON career_tracks;
 CREATE POLICY "Allow public all career_tracks" ON career_tracks FOR ALL USING (true);
+
+DROP POLICY IF EXISTS "Allow public all sessions" ON sessions;
 CREATE POLICY "Allow public all sessions" ON sessions FOR ALL USING (true);
+
+DROP POLICY IF EXISTS "Allow public all journal_templates" ON journal_templates;
 CREATE POLICY "Allow public all journal_templates" ON journal_templates FOR ALL USING (true);
-CREATE POLICY "Allow public all reading_logs" ON reading_logs FOR ALL USING (true);</pre>
+
+DROP POLICY IF EXISTS "Allow public all reading_logs" ON reading_logs;
+CREATE POLICY "Allow public all reading_logs" ON reading_logs FOR ALL USING (true);
+
+-- 7. 초기 데이터 삽입
+INSERT INTO career_tracks (id, name, color, icon, order_num) VALUES 
+('11111111-0001-4000-8000-000000000001', '자연과학', '#059669', 'Atom', 1),
+('11111111-0002-4000-8000-000000000002', '공학·IT', '#2563EB', 'Cpu', 2),
+('11111111-0003-4000-8000-000000000003', '인문·사회', '#D97706', 'BookOpen', 3),
+('11111111-0004-4000-8000-000000000004', '의약·보건', '#E11D48', 'Activity', 4),
+('11111111-0005-4000-8000-000000000005', '교육·사범', '#7C3AED', 'GraduationCap', 5),
+('11111111-0006-4000-8000-000000000006', '경영·경제', '#0891B2', 'TrendingUp', 6),
+('11111111-0007-4000-8000-000000000007', '예술·체육', '#DB2777', 'Palette', 7),
+('11111111-0008-4000-8000-000000000008', '융합·자율', '#4F46E5', 'Compass', 8)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO sessions (id, title, date, is_active) VALUES 
+('22222222-0001-4000-8000-000000000001', '1차시 : 진로 탐색 및 핵심 도서 선정', '2026-03-10', TRUE),
+('22222222-0002-4000-8000-000000000002', '2차시 : 심화 쟁점 분석 및 비판적 읽기', '2026-03-24', TRUE),
+('22222222-0003-4000-8000-000000000003', '3차시 : 진로 융합 탐구 및 인사이트 나눔', '2026-04-07', TRUE),
+('22222222-0004-4000-8000-000000000004', '4차시 : 독서 연계 주제 탐구 포트폴리오', '2026-04-21', FALSE)
+ON CONFLICT (id) DO NOTHING;</pre>
       </div>
 
     </div>
