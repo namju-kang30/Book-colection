@@ -53,6 +53,15 @@ const state = {
   selectedLog: null,
   editingLogId: null, // 일지 수정 대상 ID (null이면 새 작성)
 
+  // 계열/차시 이동 모달 (관리자용)
+  moveLogModal: {
+    isOpen: false,
+    logId: null
+  },
+
+  // 차시 수정 대상 ID (인라인 편집)
+  editingSessionId: null,
+
   // 비밀번호 인증 모달 (학생 수정/삭제용)
   authPinModal: {
     isOpen: false,
@@ -623,6 +632,7 @@ function renderModals() {
   renderAuthPinModal();
   renderAdminLoginModal();
   renderAdminModal();
+  renderMoveLogModal();
   renderSupabaseConfigModal();
 }
 
@@ -892,6 +902,14 @@ function renderDetailModal() {
           </div>
 
           <div class="flex items-center gap-1 sm:gap-2">
+            ${state.isAdmin ? `
+              <!-- Move Button for Admin -->
+              <button id="btn-move-detail" class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 transition-colors" title="진로 계열 또는 활동 차시 이동">
+                <i data-lucide="arrow-right-left" class="w-3.5 h-3.5"></i>
+                <span>계열/차시 이동</span>
+              </button>
+            ` : ''}
+
             <!-- Edit Button -->
             <button id="btn-edit-detail" class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 transition-colors" title="비밀번호 확인 후 일지 수정">
               <i data-lucide="edit-3" class="w-3.5 h-3.5"></i>
@@ -1446,6 +1464,9 @@ function renderAdminLogsTab() {
                       <button data-admin-view-log="${log.id}" class="p-1.5 rounded-lg text-indigo-600 hover:bg-indigo-50" title="상세보기">
                         <i data-lucide="eye" class="w-4 h-4"></i>
                       </button>
+                      <button data-admin-move-log="${log.id}" class="p-1.5 rounded-lg text-amber-600 hover:bg-amber-50" title="진로 계열 또는 차시 이동">
+                        <i data-lucide="arrow-right-left" class="w-4 h-4"></i>
+                      </button>
                       <button data-admin-edit-log="${log.id}" class="p-1.5 rounded-lg text-purple-600 hover:bg-purple-50" title="일지 수정">
                         <i data-lucide="edit-3" class="w-4 h-4"></i>
                       </button>
@@ -1664,10 +1685,41 @@ function renderAdminSessionsTab() {
       <div class="space-y-3">
         ${state.sessions.map(sess => {
           const logCount = state.logs.filter(l => l.session_id === sess.id).length;
+          const isEditingThisSession = state.editingSessionId === sess.id;
+
+          if (isEditingThisSession) {
+            return `
+              <div class="p-4 rounded-2xl bg-purple-50/70 border-2 border-purple-300 shadow-sm space-y-3 animate-fade-in">
+                <div class="text-xs font-bold text-purple-900 flex items-center gap-1.5">
+                  <i data-lucide="edit-3" class="w-4 h-4 text-purple-600"></i>
+                  <span>차시 정보 수정 (차시명 & 활동 일자)</span>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+                  <div class="sm:col-span-6">
+                    <label class="block text-xs font-semibold text-slate-700 mb-1">차시명</label>
+                    <input type="text" id="edit-session-title-${sess.id}" value="${escapeHtml(sess.title)}" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium" required />
+                  </div>
+                  <div class="sm:col-span-3">
+                    <label class="block text-xs font-semibold text-slate-700 mb-1">활동 일자</label>
+                    <input type="date" id="edit-session-date-${sess.id}" value="${sess.date}" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-purple-500" required />
+                  </div>
+                  <div class="sm:col-span-3 flex items-center gap-2">
+                    <button data-save-session="${sess.id}" class="flex-1 py-2 rounded-xl text-xs sm:text-sm font-semibold text-white bg-purple-600 hover:bg-purple-700 shadow-sm transition-all flex items-center justify-center gap-1">
+                      <i data-lucide="check" class="w-3.5 h-3.5"></i> 저장
+                    </button>
+                    <button data-cancel-session="${sess.id}" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-semibold text-slate-600 bg-white border border-slate-200 hover:bg-slate-50 transition-all">
+                      취소
+                    </button>
+                  </div>
+                </div>
+              </div>
+            `;
+          }
+
           return `
-            <div class="p-4 rounded-2xl bg-white border border-slate-200 shadow-sm flex items-center justify-between gap-4">
+            <div class="p-4 rounded-2xl bg-white border border-slate-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl ${sess.is_active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'} flex items-center justify-center font-bold text-xs">
+                <div class="w-10 h-10 rounded-xl ${sess.is_active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'} flex items-center justify-center font-bold text-xs shrink-0">
                   <i data-lucide="calendar" class="w-5 h-5"></i>
                 </div>
                 <div>
@@ -1681,7 +1733,11 @@ function renderAdminSessionsTab() {
                 </div>
               </div>
 
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-1.5 self-end sm:self-auto">
+                <button data-edit-session="${sess.id}" class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 transition-colors" title="차시명 및 활동일자 수정">
+                  <i data-lucide="edit-3" class="w-3.5 h-3.5"></i>
+                  <span>수정</span>
+                </button>
                 <button data-toggle-session="${sess.id}" class="px-3 py-1.5 rounded-lg text-xs font-semibold ${sess.is_active ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'} transition-colors">
                   ${sess.is_active ? '마감하기' : '활성화'}
                 </button>
@@ -1909,6 +1965,115 @@ ON CONFLICT (id) DO NOTHING;</pre>
 
     </div>
   `;
+}
+
+/**
+ * 6. 독서일지 계열 및 차시 이동 모달 (관리자용)
+ */
+function renderMoveLogModal() {
+  const modal = document.getElementById('admin-move-modal');
+  if (!modal) return;
+
+  if (!state.moveLogModal.isOpen || !state.moveLogModal.logId) {
+    modal.classList.add('hidden');
+    return;
+  }
+
+  modal.classList.remove('hidden');
+
+  const log = state.logs.find(l => l.id === state.moveLogModal.logId);
+  if (!log) {
+    state.moveLogModal = { isOpen: false, logId: null };
+    modal.classList.add('hidden');
+    return;
+  }
+
+  const currentTrack = state.tracks.find(t => t.id === log.track_id) || { name: '기타 (미지정)', color: '#64748B' };
+  const currentSession = state.sessions.find(s => s.id === log.session_id) || { title: '미지정 차시' };
+  const sInfo = log.student_info || {};
+  const content = log.content || {};
+
+  modal.innerHTML = `
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
+      <div class="glass-modal w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl border border-slate-100 flex flex-col">
+        
+        <!-- Header -->
+        <div class="px-6 py-5 bg-gradient-to-r from-purple-600 to-indigo-700 text-white flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center">
+              <i data-lucide="arrow-right-left" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h2 class="text-base font-bold">독서일지 계열 및 차시 이동</h2>
+              <p class="text-xs text-purple-100">학생 일지의 소속 진로 계열 또는 차시를 변경합니다.</p>
+            </div>
+          </div>
+          <button id="btn-close-move-modal" class="p-2 rounded-xl text-white/80 hover:text-white hover:bg-white/10 transition-colors">
+            <i data-lucide="x" class="w-5 h-5"></i>
+          </button>
+        </div>
+
+        <!-- Body -->
+        <form id="move-log-form" class="p-6 space-y-4">
+          <!-- Target Log Summary Card -->
+          <div class="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
+            <div class="flex items-center justify-between text-xs text-slate-500">
+              <span>작성자: <strong class="text-slate-800">${escapeHtml(sInfo.student_id || '')} ${escapeHtml(sInfo.name || '학생')}</strong></span>
+              <span class="text-slate-400">${new Date(log.created_at).toLocaleDateString('ko-KR')}</span>
+            </div>
+            <div class="text-sm font-bold text-slate-900 truncate">
+              📖 ${escapeHtml(content.field_book || '무제')}
+            </div>
+            <div class="flex items-center gap-2 pt-1 border-t border-slate-200/60 text-xs text-slate-600">
+              <span>현재 소속:</span>
+              <span class="px-2 py-0.5 rounded font-semibold bg-white border border-slate-200 text-slate-700">${escapeHtml(currentTrack.name)}</span>
+              <span>·</span>
+              <span class="px-2 py-0.5 rounded font-semibold bg-white border border-slate-200 text-slate-700">${escapeHtml(currentSession.title)}</span>
+            </div>
+          </div>
+
+          <!-- Select New Track -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
+              <i data-lucide="compass" class="w-3.5 h-3.5 text-indigo-600"></i> 변경할 진로 계열 선택
+            </label>
+            <select id="move-target-track-id" required class="w-full px-3.5 py-2.5 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
+              ${state.tracks.map(t => `
+                <option value="${t.id}" ${t.id === log.track_id ? 'selected' : ''}>${escapeHtml(t.name)}</option>
+              `).join('')}
+            </select>
+          </div>
+
+          <!-- Select New Session -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1">
+              <i data-lucide="calendar" class="w-3.5 h-3.5 text-indigo-600"></i> 변경할 활동 차시 선택
+            </label>
+            <select id="move-target-session-id" required class="w-full px-3.5 py-2.5 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
+              ${state.sessions.map(s => `
+                <option value="${s.id}" ${s.id === log.session_id ? 'selected' : ''}>${escapeHtml(s.title)} (${s.date})</option>
+              `).join('')}
+            </select>
+          </div>
+
+          <!-- Footer Actions -->
+          <div class="flex items-center justify-end gap-2.5 pt-3 border-t border-slate-100">
+            <button type="button" id="btn-cancel-move-modal" class="px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 transition-all">
+              취소
+            </button>
+            <button type="submit" id="btn-submit-move" class="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white bg-purple-600 hover:bg-purple-700 shadow-md shadow-purple-200 transition-all">
+              <i data-lucide="check" class="w-4 h-4"></i>
+              <span>이동 완료</span>
+            </button>
+          </div>
+        </form>
+
+      </div>
+    </div>
+  `;
+
+  lucide.createIcons();
+  bindMoveLogModalEvents();
 }
 
 /**
@@ -2298,6 +2463,20 @@ function bindDetailModalEvents() {
   if (closeBtn) closeBtn.onclick = closeModal;
   if (closeBottomBtn) closeBottomBtn.onclick = closeModal;
 
+  // 계열/차시 이동 버튼 클릭 (관리자 전용)
+  const moveBtn = document.getElementById('btn-move-detail');
+  if (moveBtn) {
+    moveBtn.onclick = () => {
+      const log = state.selectedLog;
+      if (!log) return;
+      state.moveLogModal = {
+        isOpen: true,
+        logId: log.id
+      };
+      renderMoveLogModal();
+    };
+  }
+
   // 수정 버튼 클릭
   if (editBtn) {
     editBtn.onclick = () => {
@@ -2444,6 +2623,77 @@ function bindAuthPinModalEvents() {
           renderTrackSelector();
           renderFeed();
           showToast('success', '독서일지가 안전하게 삭제되었습니다.');
+        }
+      }
+    };
+  }
+}
+
+/**
+ * 독서일지 계열 및 차시 이동 모달 이벤트 바인딩
+ */
+function bindMoveLogModalEvents() {
+  const closeBtn = document.getElementById('btn-close-move-modal');
+  const cancelBtn = document.getElementById('btn-cancel-move-modal');
+  const form = document.getElementById('move-log-form');
+
+  const closeModal = () => {
+    state.moveLogModal = { isOpen: false, logId: null };
+    renderMoveLogModal();
+  };
+
+  if (closeBtn) closeBtn.onclick = closeModal;
+  if (cancelBtn) cancelBtn.onclick = closeModal;
+
+  if (form) {
+    form.onsubmit = async e => {
+      e.preventDefault();
+      const logId = state.moveLogModal.logId;
+      const targetTrackId = document.getElementById('move-target-track-id')?.value;
+      const targetSessionId = document.getElementById('move-target-session-id')?.value;
+
+      if (!logId || !targetTrackId || !targetSessionId) return;
+
+      const log = state.logs.find(l => l.id === logId);
+      if (!log) return;
+
+      const submitBtn = document.getElementById('btn-submit-move');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin inline mr-1"></i> 이동 처리 중...`;
+        lucide.createIcons();
+      }
+
+      try {
+        const updated = await updateReadingLog(logId, {
+          track_id: targetTrackId,
+          session_id: targetSessionId
+        });
+
+        // 로컬 상태 동기화
+        const idx = state.logs.findIndex(l => l.id === logId);
+        if (idx !== -1 && updated) {
+          state.logs[idx] = { ...state.logs[idx], ...updated };
+        }
+        if (state.selectedLog && state.selectedLog.id === logId) {
+          state.selectedLog = { ...state.selectedLog, ...updated };
+        }
+
+        const newTrack = state.tracks.find(t => t.id === targetTrackId);
+        const newSession = state.sessions.find(s => s.id === targetSessionId);
+
+        state.moveLogModal = { isOpen: false, logId: null };
+        renderModals();
+        renderTrackSelector();
+        renderSessionFilter();
+        renderFeed();
+
+        showToast('success', `🎉 '${log.student_info?.name || '학생'}'의 일지가 [${newTrack?.name || '기타'} / ${newSession?.title?.split(':')[0] || '차시'}]로 이동되었습니다!`);
+      } catch (err) {
+        showToast('error', `일지 이동 중 오류가 발생했습니다: ${err.message}`);
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = `<span>이동 완료</span>`;
         }
       }
     };
@@ -2650,6 +2900,18 @@ function bindAdminModalEvents() {
     };
   }
 
+  // 관리자 일지 이동 버튼 (계열/차시 변경 모달 열기)
+  document.querySelectorAll('[data-admin-move-log]').forEach(btn => {
+    btn.onclick = () => {
+      const logId = btn.getAttribute('data-admin-move-log');
+      state.moveLogModal = {
+        isOpen: true,
+        logId: logId
+      };
+      renderMoveLogModal();
+    };
+  });
+
   // 관리자 일지 수정 버튼
   document.querySelectorAll('[data-admin-edit-log]').forEach(btn => {
     btn.onclick = () => {
@@ -2844,6 +3106,60 @@ function bindAdminModalEvents() {
     };
   }
 
+  // 차시 수정 버튼 (인라인 편집 모드 진입)
+  document.querySelectorAll('[data-edit-session]').forEach(btn => {
+    btn.onclick = () => {
+      const sessId = btn.getAttribute('data-edit-session');
+      state.editingSessionId = sessId;
+      renderAdminModal();
+    };
+  });
+
+  // 차시 수정 취소 버튼
+  document.querySelectorAll('[data-cancel-session]').forEach(btn => {
+    btn.onclick = () => {
+      state.editingSessionId = null;
+      renderAdminModal();
+    };
+  });
+
+  // 차시 수정 저장 버튼
+  document.querySelectorAll('[data-save-session]').forEach(btn => {
+    btn.onclick = async () => {
+      const sessId = btn.getAttribute('data-save-session');
+      const titleInput = document.getElementById(`edit-session-title-${sessId}`);
+      const dateInput = document.getElementById(`edit-session-date-${sessId}`);
+      const title = titleInput?.value.trim();
+      const date = dateInput?.value;
+
+      if (!title || !date) {
+        showToast('error', '차시명과 활동 일자를 모두 입력해 주세요.');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.innerHTML = `<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin inline mr-1"></i> 저장 중...`;
+      lucide.createIcons();
+
+      try {
+        const updated = await updateSession(sessId, { title, date });
+        const idx = state.sessions.findIndex(s => s.id === sessId);
+        if (idx !== -1 && updated) {
+          state.sessions[idx] = { ...state.sessions[idx], ...updated };
+        }
+        state.editingSessionId = null;
+        renderAdminModal();
+        renderSessionFilter();
+        renderFeed();
+        showToast('success', `🎉 '${title}' 차시 정보가 성공적으로 수정되었습니다!`);
+      } catch (err) {
+        showToast('error', `차시 수정 중 오류가 발생했습니다: ${err.message}`);
+        btn.disabled = false;
+        btn.innerHTML = '저장';
+      }
+    };
+  });
+
   document.querySelectorAll('[data-toggle-session]').forEach(btn => {
     btn.onclick = async () => {
       const sessId = btn.getAttribute('data-toggle-session');
@@ -2861,9 +3177,10 @@ function bindAdminModalEvents() {
   document.querySelectorAll('[data-delete-session]').forEach(btn => {
     btn.onclick = async () => {
       const sessId = btn.getAttribute('data-delete-session');
-      if (confirm('이 활동 차시를 삭제하시겠습니까?')) {
+      if (confirm('이 활동 차시를 삭제하시겠습니까? (해당 차시의 독서일지도 함께 정리됩니다)')) {
         await deleteSession(sessId);
         state.sessions = state.sessions.filter(s => s.id !== sessId);
+        state.logs = state.logs.filter(l => l.session_id !== sessId);
         if (state.selectedSessionId === sessId) state.selectedSessionId = 'all';
         renderAdminModal();
         renderSessionFilter();
