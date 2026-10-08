@@ -1,590 +1,287 @@
-/**
- * 통합 데이터 스토리지 서비스 (Supabase + LocalStorage 하이브리드)
- */
-
-import { getSupabaseClient } from './supabase.js';
+/** Supabase 저장 실패를 로컬 제출 성공으로 처리하지 않는다. */
+import { getSupabaseClient, getSupabaseConfig } from './supabase.js';
 import { DEFAULT_TRACKS, DEFAULT_SESSIONS, DEFAULT_TEMPLATE, INITIAL_READING_LOGS } from './defaultData.js';
+import { validateBackup, buildRestorePlan } from './backup.js';
 
-const LS_KEY_TRACKS = 'reading_log_tracks';
-const LS_KEY_SESSIONS = 'reading_log_sessions';
-const LS_KEY_TEMPLATE = 'reading_log_template';
-const LS_KEY_LOGS = 'reading_log_entries';
-const LS_KEY_LIKES = 'reading_log_user_likes';
+const KEYS = { career_tracks: 'reading_log_tracks', sessions: 'reading_log_sessions',
+  journal_templates: 'reading_log_template', reading_logs: 'reading_log_entries' };
+const LIKES_KEY = 'reading_log_user_likes';
+const warnings = new Map();
+const PAGE_SIZE = 500;
 
-/**
- * 표준 UUID v4 생성 함수 (Supabase PostgreSQL UUID 컬럼 완전 호환)
- */
 export function generateUUID() {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
+    return (c === 'x' ? r : (r & 3 | 8)).toString(16);
   });
 }
-
-// 로컬 스토리지 초기화 및 레거시 데이터 마이그레이션
-function initLocalStorage() {
+export function isCloudConfigured() {
+  const config = getSupabaseConfig();
+  return Boolean(config.url && config.anonKey);
+}
+export function getStorageWarnings() { return [...warnings.values()]; }
+function clientForWrite() {
+  const client = getSupabaseClient();
+  if (isCloudConfigured() && !client) throw new Error('서버 연결 라이브러리를 불러오지 못했습니다. 새로고침 후 다시 제출해 주세요. 작성 내용은 유지됩니다.');
+  return client;
+}
+function readLocal(table) {
   try {
-    const tracksRaw = localStorage.getItem(LS_KEY_TRACKS);
-    if (!tracksRaw || tracksRaw.includes('track-nat-sci')) {
-      localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(DEFAULT_TRACKS));
-    }
-
-    const sessionsRaw = localStorage.getItem(LS_KEY_SESSIONS);
-    if (!sessionsRaw || sessionsRaw.includes('session-1')) {
-      localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(DEFAULT_SESSIONS));
-    }
-
-    const templateRaw = localStorage.getItem(LS_KEY_TEMPLATE);
-    if (!templateRaw || templateRaw.includes('template-default')) {
-      localStorage.setItem(LS_KEY_TEMPLATE, JSON.stringify(DEFAULT_TEMPLATE));
-    }
-
-    const logsRaw = localStorage.getItem(LS_KEY_LOGS);
-    if (!logsRaw || logsRaw.includes('log-1')) {
-      localStorage.setItem(LS_KEY_LOGS, JSON.stringify(INITIAL_READING_LOGS));
-    }
-  } catch (e) {
-    console.warn('initLocalStorage error', e);
+    const raw = localStorage.getItem(KEYS[table]);
+    if (raw === null) return table === 'journal_templates' ? DEFAULT_TEMPLATE : [];
+    const data = JSON.parse(raw);
+    if (table === 'journal_templates' ? !data || !Array.isArray(data.fields) : !Array.isArray(data)) throw new Error('형식 오류');
+    return data;
+  } catch { throw new Error('브라우저 저장 데이터를 읽을 수 없습니다. 기존 데이터를 삭제하지 말고 관리자에게 문의해 주세요.'); }
+}
+function writeLocal(table, data) {
+  try { localStorage.setItem(KEYS[table], JSON.stringify(data)); }
+  catch { throw new Error('브라우저 저장 공간이 부족하거나 저장이 차단되었습니다. 작성 내용을 복사해 보관한 뒤 다시 시도해 주세요.'); }
+}
+function cache(table, data) {
+  try { localStorage.setItem(KEYS[table], JSON.stringify(data)); }
+  catch (error) { console.warn('로컬 캐시 저장 실패 (서버 저장은 완료됨)', error); }
+}
+function cacheLog(log) {
+  try { cache('reading_logs', [log, ...readLocal('reading_logs').filter(row => row.id !== log.id)]); }
+  catch (error) { console.warn('로컬 캐시 읽기 실패', error); }
+}
+function localDefaults() {
+  const defaults = { career_tracks: DEFAULT_TRACKS, sessions: DEFAULT_SESSIONS,
+    journal_templates: DEFAULT_TEMPLATE, reading_logs: isCloudConfigured() ? [] : INITIAL_READING_LOGS };
+  for (const [table, data] of Object.entries(defaults)) {
+    try { if (localStorage.getItem(KEYS[table]) === null) writeLocal(table, data); }
+    catch (error) { console.warn(error.message); }
   }
 }
-initLocalStorage();
-
-/**
- * 1. 진로 계열 (Career Tracks)
- */
-export async function getCareerTracks() {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('career_tracks')
-        .select('*')
-        .order('order_num', { ascending: true })
-        .order('created_at', { ascending: true });
-
-      if (!error && data && data.length > 0) {
-        localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(data));
-        return data;
-      }
-      if (error) {
-        console.warn('Supabase getCareerTracks error:', error);
-      }
-    } catch (e) {
-      console.warn('Supabase getCareerTracks error, fallback to local', e);
-    }
+localDefaults();
+function checkResult(result) {
+  if (result.error) throw new Error(result.error.message || '서버 요청에 실패했습니다.');
+  return result.data;
+}
+/** ID 순서로 끝까지 조회하여 Supabase 기본 1,000행 제한을 피한다. */
+async function cloudRows(client, table) {
+  const result = [];
+  let lastId = null;
+  while (true) {
+    let query = client.from(table).select('*').order('id', { ascending: true }).limit(PAGE_SIZE);
+    if (lastId) query = query.gt('id', lastId);
+    const page = checkResult(await query);
+    if (!Array.isArray(page)) throw new Error('서버 응답 형식이 올바르지 않습니다.');
+    result.push(...page);
+    if (page.length < PAGE_SIZE) return result;
+    lastId = page[page.length - 1].id;
   }
-
+}
+async function rows(table, { strict = false } = {}) {
+  let client;
   try {
-    const raw = localStorage.getItem(LS_KEY_TRACKS);
-    return raw ? JSON.parse(raw) : DEFAULT_TRACKS;
-  } catch {
-    return DEFAULT_TRACKS;
-  }
-}
-
-export async function createCareerTrack(track) {
-  const newTrack = {
-    ...track,
-    id: track.id || generateUUID(),
-    created_at: new Date().toISOString()
-  };
-
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('career_tracks')
-        .insert([newTrack])
-        .select()
-        .single();
-      if (!error && data) {
-        const list = await getCareerTracks();
-        const filtered = list.filter(t => t.id !== data.id);
-        localStorage.setItem(LS_KEY_TRACKS, JSON.stringify([...filtered, data]));
-        return data;
-      }
-      if (error) {
-        console.warn('Supabase createCareerTrack error:', error);
-      }
-    } catch (e) {
-      console.warn('Supabase insert track error', e);
+    client = clientForWrite();
+    if (client) {
+      const data = await cloudRows(client, table);
+      if (table !== 'journal_templates') cache(table, data);
+      warnings.delete(table);
+      return data;
     }
+  } catch (error) {
+    warnings.set(table, '서버 데이터를 불러오지 못해 최근 저장된 목록을 표시합니다. 제출 완료 여부는 서버 저장 결과로 확인됩니다.');
+    if (strict) throw error;
   }
-
-  const list = await getCareerTracks();
-  const updated = [...list, newTrack];
-  localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(updated));
-  return newTrack;
+  if (!isCloudConfigured()) warnings.delete(table);
+  const data = readLocal(table);
+  return table === 'journal_templates' ? [data] : data;
 }
-
-export async function updateCareerTrack(id, updates) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('career_tracks')
-        .update(updates)
-        .eq('id', id)
-        .select()
-        .single();
-      if (!error && data) {
-        const list = await getCareerTracks();
-        const updated = list.map(t => t.id === id ? { ...t, ...data } : t);
-        localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(updated));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase update track error', e);
-    }
+export async function getCareerTracks(options) {
+  return (await rows('career_tracks', options)).sort((a, b) => (a.order_num || 0) - (b.order_num || 0));
+}
+export async function getSessions(options) {
+  return (await rows('sessions', options)).sort((a, b) => a.date.localeCompare(b.date));
+}
+export async function getActiveTemplate(options) {
+  const templates = await rows('journal_templates', options);
+  const active = templates.filter(t => t.is_active).sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  if (active) { cache('journal_templates', active); return active; }
+  return { title: '등록된 양식 없음', fields: [], is_active: false };
+}
+export async function getReadingLogs(trackId = null, sessionId = null, options) {
+  let logs = await rows('reading_logs', options);
+  if (trackId && trackId !== 'all') logs = logs.filter(l => l.track_id === trackId);
+  if (sessionId && sessionId !== 'all') logs = logs.filter(l => l.session_id === sessionId);
+  return logs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+}
+async function createRow(table, row) {
+  const client = clientForWrite();
+  if (client) {
+    const data = checkResult(await client.from(table).insert([row]).select().single());
+    if (!data) throw new Error('서버에서 저장 결과를 확인할 수 없습니다.');
+    return data;
   }
-
-  const list = await getCareerTracks();
-  const updated = list.map(t => t.id === id ? { ...t, ...updates } : t);
-  localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(updated));
-  return updated.find(t => t.id === id);
+  writeLocal(table, [...readLocal(table), row]);
+  return row;
 }
-
+async function updateRow(table, id, updates) {
+  const client = clientForWrite();
+  if (client) {
+    const data = checkResult(await client.from(table).update(updates).eq('id', id).select().single());
+    if (!data) throw new Error('수정할 데이터를 찾을 수 없습니다.');
+    return data;
+  }
+  const list = readLocal(table);
+  if (!list.some(row => row.id === id)) throw new Error('수정할 데이터를 찾을 수 없습니다.');
+  const next = list.map(row => row.id === id ? { ...row, ...updates } : row);
+  writeLocal(table, next);
+  return next.find(row => row.id === id);
+}
+async function deleteRow(table, id) {
+  const client = clientForWrite();
+  if (client) checkResult(await client.from(table).delete().eq('id', id));
+  else writeLocal(table, readLocal(table).filter(row => row.id !== id));
+  if (client) { try { cache(table, readLocal(table).filter(row => row.id !== id)); } catch {} }
+  return true;
+}
+export function createCareerTrack(track) {
+  return createRow('career_tracks', { id: track.id || generateUUID(), name: track.name, color: track.color,
+    icon: track.icon || 'BookOpen', order_num: track.order_num || 0, created_at: new Date().toISOString() });
+}
+export function updateCareerTrack(id, updates) { return updateRow('career_tracks', id, updates); }
 export async function deleteCareerTrack(id) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      await supabase.from('career_tracks').delete().eq('id', id);
-    } catch (e) {
-      console.warn('Supabase delete track error', e);
-    }
-  }
-
-  const list = await getCareerTracks();
-  const updated = list.filter(t => t.id !== id);
-  localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(updated));
+  await deleteRow('career_tracks', id);
+  try {
+    const logs = readLocal('reading_logs').map(l => l.track_id === id ? { ...l, track_id: null } : l);
+    if (isCloudConfigured()) cache('reading_logs', logs); else writeLocal('reading_logs', logs);
+  } catch (error) { if (!isCloudConfigured()) throw error; }
   return true;
 }
-
-/**
- * 2. 활동 차시 (Sessions)
- */
-export async function getSessions() {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('sessions')
-        .select('*')
-        .order('date', { ascending: true });
-
-      if (!error && data && data.length > 0) {
-        localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(data));
-        return data;
-      }
-      if (error) {
-        console.warn('Supabase getSessions error:', error);
-      }
-    } catch (e) {
-      console.warn('Supabase getSessions error, fallback to local', e);
-    }
-  }
-
-  try {
-    const raw = localStorage.getItem(LS_KEY_SESSIONS);
-    return raw ? JSON.parse(raw) : DEFAULT_SESSIONS;
-  } catch {
-    return DEFAULT_SESSIONS;
-  }
+export function createSession(session) {
+  return createRow('sessions', { ...session, id: session.id || generateUUID(),
+    is_active: session.is_active ?? true, created_at: new Date().toISOString() });
 }
-
-export async function createSession(session) {
-  const newSession = {
-    ...session,
-    id: session.id || generateUUID(),
-    is_active: session.is_active !== undefined ? session.is_active : true,
-    created_at: new Date().toISOString()
-  };
-
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('sessions')
-        .insert([newSession])
-        .select()
-        .single();
-      if (!error && data) {
-        const list = await getSessions();
-        const filtered = list.filter(s => s.id !== data.id);
-        localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify([...filtered, data]));
-        return data;
-      }
-      if (error) {
-        console.warn('Supabase createSession error:', error);
-      }
-    } catch (e) {
-      console.warn('Supabase insert session error', e);
-    }
-  }
-
-  const list = await getSessions();
-  const updated = [...list, newSession];
-  localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(updated));
-  return newSession;
-}
-
-export async function updateSession(id, updates) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('sessions')
-        .update(updates)
-        .eq('id', id)
-        .select()
-        .single();
-      if (!error && data) {
-        const list = await getSessions();
-        const updated = list.map(s => s.id === id ? { ...s, ...data } : s);
-        localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(updated));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase update session error', e);
-    }
-  }
-
-  const list = await getSessions();
-  const updated = list.map(s => s.id === id ? { ...s, ...updates } : s);
-  localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(updated));
-  return updated.find(s => s.id === id);
-}
-
+export function updateSession(id, updates) { return updateRow('sessions', id, updates); }
 export async function deleteSession(id) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      await supabase.from('sessions').delete().eq('id', id);
-    } catch (e) {
-      console.warn('Supabase delete session error', e);
-    }
-  }
-
-  const list = await getSessions();
-  const updated = list.filter(s => s.id !== id);
-  localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(updated));
+  await deleteRow('sessions', id);
+  try {
+    const remaining = readLocal('reading_logs').filter(l => l.session_id !== id);
+    if (isCloudConfigured()) cache('reading_logs', remaining); else writeLocal('reading_logs', remaining);
+  } catch (error) { if (!isCloudConfigured()) throw error; }
   return true;
 }
-
-/**
- * 3. 공통 독서 일지 양식 (Journal Templates)
- */
-export async function getActiveTemplate() {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('journal_templates')
-        .select('*')
-        .eq('is_active', true)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (!error && data) {
-        localStorage.setItem(LS_KEY_TEMPLATE, JSON.stringify(data));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase getActiveTemplate error', e);
-    }
-  }
-
-  try {
-    const raw = localStorage.getItem(LS_KEY_TEMPLATE);
-    return raw ? JSON.parse(raw) : DEFAULT_TEMPLATE;
-  } catch {
-    return DEFAULT_TEMPLATE;
-  }
-}
-
 export async function saveTemplate(template) {
-  const updatedTemplate = {
-    ...template,
-    id: template.id || generateUUID(),
-    is_active: true,
-    created_at: new Date().toISOString()
-  };
-
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      // 기존 active 템플릿 비활성화 또는 upsert
-      await supabase
-        .from('journal_templates')
-        .update({ is_active: false })
-        .neq('id', updatedTemplate.id);
-
-      const { data, error } = await supabase
-        .from('journal_templates')
-        .upsert([updatedTemplate])
-        .select()
-        .single();
-
-      if (!error && data) {
-        localStorage.setItem(LS_KEY_TEMPLATE, JSON.stringify(data));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase saveTemplate error', e);
-    }
+  const updated = { ...template, id: template.id || generateUUID(), is_active: true, created_at: new Date().toISOString() };
+  const client = clientForWrite();
+  if (client) {
+    const data = checkResult(await client.from('journal_templates').upsert([updated]).select().single());
+    checkResult(await client.from('journal_templates').update({ is_active: false }).neq('id', updated.id));
+    cache('journal_templates', data);
+    return data;
   }
-
-  localStorage.setItem(LS_KEY_TEMPLATE, JSON.stringify(updatedTemplate));
-  return updatedTemplate;
+  writeLocal('journal_templates', updated);
+  return updated;
 }
-
-/**
- * 4. 학생 독서 일지 (Reading Logs)
- */
-export async function getReadingLogs(trackId = null, sessionId = null) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      let query = supabase
-        .from('reading_logs')
-        .select('*')
-        .order('created_at', { ascending: false });
-
-      if (trackId && trackId !== 'all') {
-        query = query.eq('track_id', trackId);
-      }
-      if (sessionId && sessionId !== 'all') {
-        query = query.eq('session_id', sessionId);
-      }
-
-      const { data, error } = await query;
-      if (!error && data) {
-        // 전체 조회 시 로컬 캐시 동기화
-        if (!trackId || trackId === 'all') {
-          if (!sessionId || sessionId === 'all') {
-            localStorage.setItem(LS_KEY_LOGS, JSON.stringify(data));
-          }
-        }
-        return data;
-      }
-      if (error) {
-        console.warn('Supabase getReadingLogs error:', error);
-      }
-    } catch (e) {
-      console.warn('Supabase getReadingLogs error, fallback to local', e);
-    }
-  }
-
-  try {
-    const raw = localStorage.getItem(LS_KEY_LOGS);
-    let list = raw ? JSON.parse(raw) : INITIAL_READING_LOGS;
-
-    if (trackId && trackId !== 'all') {
-      list = list.filter(l => l.track_id === trackId);
-    }
-    if (sessionId && sessionId !== 'all') {
-      list = list.filter(l => l.session_id === sessionId);
-    }
-
-    return list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  } catch {
-    return INITIAL_READING_LOGS;
-  }
-}
-
 export async function createReadingLog(logData) {
-  const newLog = {
-    id: generateUUID(),
-    track_id: logData.track_id,
-    session_id: logData.session_id,
-    student_info: logData.student_info,
-    content: logData.content,
-    likes_count: 0,
-    created_at: new Date().toISOString()
-  };
-
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('reading_logs')
-        .insert([newLog])
-        .select()
-        .single();
-
-      if (error) {
-        console.error('Supabase createReadingLog insert error:', error);
-        throw new Error(error.message || 'Supabase DB 저장 실패');
-      }
-
-      if (data) {
-        // Update local cache
-        const allLogs = await getAllLogsFromLocal();
-        const filtered = allLogs.filter(l => l.id !== data.id);
-        localStorage.setItem(LS_KEY_LOGS, JSON.stringify([data, ...filtered]));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase createReadingLog failed, storing in local fallback:', e);
-      const allLogs = await getAllLogsFromLocal();
-      const updated = [newLog, ...allLogs];
-      localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
-      return newLog;
-    }
+  const [tracks, sessions] = await Promise.all([getCareerTracks({ strict: true }), getSessions({ strict: true })]);
+  if (!tracks.some(t => t.id === logData.track_id)) throw new Error('선택한 진로 계열이 삭제되었습니다. 다시 선택해 주세요.');
+  const session = sessions.find(s => s.id === logData.session_id);
+  if (!session || !session.is_active) throw new Error('선택한 차시가 마감되었거나 삭제되었습니다. 진행 중인 차시를 선택해 주세요.');
+  const newLog = { id: logData.id || generateUUID(), track_id: logData.track_id, session_id: logData.session_id,
+    student_info: logData.student_info, content: logData.content, likes_count: 0, created_at: new Date().toISOString() };
+  if (!/^[a-f0-9]{64}$/i.test(newLog.student_info?.password_hash || '')) throw new Error('비밀번호를 안전하게 저장할 수 없습니다. HTTPS 주소로 접속해 주세요.');
+  const client = clientForWrite();
+  if (client) {
+    // 응답 전 연결이 끊겨도 같은 ID로 재시도하면 중복이 생기지 않는다.
+    let data = checkResult(await client.from('reading_logs').upsert([newLog], { onConflict: 'id', ignoreDuplicates: true }).select().maybeSingle());
+    if (!data) data = checkResult(await client.from('reading_logs').select('*').eq('id', newLog.id).single());
+    if (!data) throw new Error('서버에서 저장 결과를 확인할 수 없습니다. 같은 화면에서 다시 제출해 주세요.');
+    cacheLog(data);
+    return data;
   }
-
-  // Fallback to local storage (Supabase client 미연결 시)
-  const allLogs = await getAllLogsFromLocal();
-  const updated = [newLog, ...allLogs];
-  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
+  const list = readLocal('reading_logs');
+  const existing = list.find(row => row.id === newLog.id);
+  if (existing) return existing;
+  writeLocal('reading_logs', [newLog, ...list]);
   return newLog;
 }
-
 export async function updateReadingLog(id, updates) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('reading_logs')
-        .update(updates)
-        .eq('id', id)
-        .select()
-        .single();
-      if (!error && data) {
-        const allLogs = await getAllLogsFromLocal();
-        const updated = allLogs.map(l => l.id === id ? { ...l, ...data } : l);
-        localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
-        return data;
-      }
-    } catch (e) {
-      console.warn('Supabase updateReadingLog error', e);
-    }
-  }
-
-  const allLogs = await getAllLogsFromLocal();
-  const updated = allLogs.map(l => l.id === id ? { ...l, ...updates } : l);
-  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
-  return updated.find(l => l.id === id);
+  const data = await updateRow('reading_logs', id, updates);
+  if (isCloudConfigured()) cacheLog(data);
+  return data;
 }
-
-export async function deleteReadingLog(id) {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    try {
-      await supabase.from('reading_logs').delete().eq('id', id);
-    } catch (e) {
-      console.warn('Supabase deleteReadingLog error', e);
-    }
-  }
-
-  const allLogs = await getAllLogsFromLocal();
-  const updated = allLogs.filter(l => l.id !== id);
-  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(updated));
-  return true;
-}
-
+export function deleteReadingLog(id) { return deleteRow('reading_logs', id); }
 export async function toggleLikeReadingLog(id) {
-  // 로컬에서 유저의 좋아요 상태 확인
-  let likedIds = [];
-  try {
-    likedIds = JSON.parse(localStorage.getItem(LS_KEY_LIKES) || '[]');
-  } catch {}
-
-  const isLiked = likedIds.includes(id);
-  const nextLiked = !isLiked;
-
-  if (nextLiked) {
-    likedIds.push(id);
-  } else {
-    likedIds = likedIds.filter(item => item !== id);
-  }
-  localStorage.setItem(LS_KEY_LIKES, JSON.stringify(likedIds));
-
-  // 일지 목록에서 카운트 조정
-  const allLogs = await getAllLogsFromLocal();
-  const target = allLogs.find(l => l.id === id);
-  if (!target) return { liked: nextLiked, count: 0 };
-
-  const currentCount = target.likes_count || 0;
-  const newCount = nextLiked ? currentCount + 1 : Math.max(0, currentCount - 1);
-  target.likes_count = newCount;
-
-  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(allLogs));
-
-  const supabase = getSupabaseClient();
-  if (supabase) {
+  let likedIds;
+  try { likedIds = JSON.parse(localStorage.getItem(LIKES_KEY) || '[]'); } catch { likedIds = []; }
+  if (!Array.isArray(likedIds)) likedIds = [];
+  const nextLiked = !likedIds.includes(id);
+  const target = (await getReadingLogs(null, null, { strict: true })).find(l => l.id === id);
+  if (!target) throw new Error('일지를 찾을 수 없습니다. 목록을 새로고침해 주세요.');
+  const count = Math.max(0, (Number(target.likes_count) || 0) + (nextLiked ? 1 : -1));
+  await updateReadingLog(id, { likes_count: count });
+  try { localStorage.setItem(LIKES_KEY, JSON.stringify(nextLiked ? [...likedIds, id] : likedIds.filter(x => x !== id))); } catch {}
+  return { liked: nextLiked, count };
+}
+export function isLogLikedByUser(id) {
+  try { const ids = JSON.parse(localStorage.getItem(LIKES_KEY) || '[]'); return Array.isArray(ids) && ids.includes(id); }
+  catch { return false; }
+}
+export async function exportReadingLogBackup() {
+  const [career_tracks, sessions, journal_templates, reading_logs] = await Promise.all([
+    rows('career_tracks', { strict: true }), rows('sessions', { strict: true }),
+    rows('journal_templates', { strict: true }), rows('reading_logs', { strict: true })
+  ]);
+  return validateBackup({ format: 'reading-log-backup', version: 1, exported_at: new Date().toISOString(),
+    data: { career_tracks, sessions, journal_templates, reading_logs } });
+}
+export async function importReadingLogBackup(input) {
+  const backup = validateBackup(input);
+  const current = await exportReadingLogBackup();
+  const plan = buildRestorePlan(backup, current);
+  const client = clientForWrite();
+  let added = plan.data.reading_logs.length;
+  if (client) {
+    // 의존 데이터를 먼저 추가한다. 작은 요청으로 나누며 기존 ID는 유지한다.
+    let completed = false;
+    added = 0;
     try {
-      await supabase
-        .from('reading_logs')
-        .update({ likes_count: newCount })
-        .eq('id', id);
-    } catch (e) {
-      console.warn('Supabase update likes error', e);
+      for (const table of ['career_tracks', 'sessions', 'journal_templates', 'reading_logs']) {
+        for (let offset = 0; offset < plan.data[table].length; offset += 250) {
+          const batch = plan.data[table].slice(offset, offset + 250);
+          const inserted = checkResult(await client.from(table).upsert(batch, { onConflict: 'id', ignoreDuplicates: true }).select('id'));
+          if (!Array.isArray(inserted)) throw new Error('서버에서 불러오기 결과를 확인할 수 없습니다.');
+          if (table === 'reading_logs') added += inserted.length;
+          completed = true;
+        }
+      }
+    } catch (error) {
+      throw new Error(`${completed ? `일부 데이터가 추가되었습니다(일지 ${added}건 확인). ` : ''}불러오기를 완료하지 못했습니다: ${error.message} 같은 파일로 다시 시도할 수 있습니다. 기존 일지는 유지됩니다.`);
+    }
+  } else {
+    const original = Object.fromEntries(Object.values(KEYS).map(key => [key, localStorage.getItem(key)]));
+    try {
+      for (const table of ['career_tracks', 'sessions', 'reading_logs']) writeLocal(table, [...current.data[table], ...plan.data[table]]);
+      const template = [...current.data.journal_templates, ...plan.data.journal_templates].find(t => t.is_active);
+      if (template) writeLocal('journal_templates', template);
+    } catch (error) {
+      for (const [key, value] of Object.entries(original)) {
+        try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch {}
+      }
+      throw error;
     }
   }
-
-  return { liked: nextLiked, count: newCount };
+  return { added, skipped: backup.data.reading_logs.length - added };
 }
-
-export function isLogLikedByUser(id) {
-  try {
-    const likedIds = JSON.parse(localStorage.getItem(LS_KEY_LIKES) || '[]');
-    return likedIds.includes(id);
-  } catch {
-    return false;
-  }
-}
-
-async function getAllLogsFromLocal() {
-  try {
-    const raw = localStorage.getItem(LS_KEY_LOGS);
-    return raw ? JSON.parse(raw) : INITIAL_READING_LOGS;
-  } catch {
-    return INITIAL_READING_LOGS;
-  }
-}
-
-/**
- * 실시간 구독 설정
- */
 export function subscribeToRealtimeLogs(onInsert, onUpdate, onDelete) {
-  const supabase = getSupabaseClient();
-  if (!supabase) return null;
-
+  const client = getSupabaseClient();
+  if (!client) return null;
   try {
-    const channel = supabase
-      .channel('public:reading_logs')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'reading_logs' }, payload => {
-        if (onInsert) onInsert(payload.new);
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'reading_logs' }, payload => {
-        if (onUpdate) onUpdate(payload.new);
-      })
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'reading_logs' }, payload => {
-        if (onDelete) onDelete(payload.old);
-      })
-      .subscribe();
-
-    return channel;
-  } catch (err) {
-    console.warn('Realtime subscription failed:', err);
-    return null;
-  }
+    return client.channel('public:reading_logs')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'reading_logs' }, p => onInsert?.(p.new))
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'reading_logs' }, p => onUpdate?.(p.new))
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'reading_logs' }, p => onDelete?.(p.old)).subscribe();
+  } catch (error) { console.warn('Realtime subscription failed', error); return null; }
 }
-
-/**
- * 초기 예시 데이터로 리셋
- */
 export function resetToDemoData() {
-  localStorage.setItem(LS_KEY_TRACKS, JSON.stringify(DEFAULT_TRACKS));
-  localStorage.setItem(LS_KEY_SESSIONS, JSON.stringify(DEFAULT_SESSIONS));
-  localStorage.setItem(LS_KEY_TEMPLATE, JSON.stringify(DEFAULT_TEMPLATE));
-  localStorage.setItem(LS_KEY_LOGS, JSON.stringify(INITIAL_READING_LOGS));
-  localStorage.removeItem(LS_KEY_LIKES);
+  writeLocal('career_tracks', DEFAULT_TRACKS); writeLocal('sessions', DEFAULT_SESSIONS);
+  writeLocal('journal_templates', DEFAULT_TEMPLATE); writeLocal('reading_logs', INITIAL_READING_LOGS);
+  localStorage.removeItem(LIKES_KEY);
   return true;
 }

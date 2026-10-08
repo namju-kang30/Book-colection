@@ -2,6 +2,20 @@
  * Supabase 클라이언트 및 설정 관리 모듈
  */
 
+// 네트워크가 응답하지 않아도 작성 폼이 무한히 저장 중 상태로 남지 않게 한다.
+export async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, 15000);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener('abort', abort);
+  }
+}
+
 export const DEFAULT_SUPABASE_URL = 'https://hidimbmtfhjjkosyndja.supabase.co';
 export const DEFAULT_SUPABASE_ANON_KEY = 'sb_publishable_EILdYnvkzXAx3SVUHQovUQ_UL6nYo7f';
 
@@ -12,7 +26,7 @@ export function getSupabaseConfig() {
     const saved = localStorage.getItem(STORAGE_KEY_CONFIG);
     if (saved) {
       const parsed = JSON.parse(saved);
-      if (parsed.url && parsed.anonKey) {
+      if (typeof parsed.url === 'string' && typeof parsed.anonKey === 'string') {
         return parsed;
       }
     }
@@ -34,8 +48,14 @@ export function saveSupabaseConfig(url, anonKey) {
   const cleanUrl = (url || '').trim();
   const cleanKey = (anonKey || '').trim();
 
-  if (!cleanUrl || !cleanKey) {
-    localStorage.removeItem(STORAGE_KEY_CONFIG);
+  if (Boolean(cleanUrl) !== Boolean(cleanKey)) throw new Error('Supabase URL과 API 키를 함께 입력해 주세요.');
+  if (cleanUrl) {
+    let parsed;
+    try { parsed = new URL(cleanUrl); } catch { throw new Error('올바른 Supabase URL을 입력해 주세요.'); }
+    if (parsed.protocol !== 'https:' && parsed.hostname !== 'localhost') throw new Error('HTTPS Supabase URL을 입력해 주세요.');
+  }
+  if (!cleanUrl && !cleanKey) {
+    localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify({ url: '', anonKey: '' }));
     supabaseClient = null;
     return false;
   }
@@ -59,6 +79,7 @@ export function getSupabaseClient() {
   if (config.url && config.anonKey && window.supabase) {
     try {
       supabaseClient = window.supabase.createClient(config.url, config.anonKey, {
+        global: { fetch: fetchWithTimeout },
         auth: {
           persistSession: false,
           autoRefreshToken: false
@@ -75,11 +96,13 @@ export function getSupabaseClient() {
 
 export function initSupabaseClient(url, anonKey) {
   if (!window.supabase) {
+    supabaseClient = null;
     console.error('Supabase library not loaded yet');
     return null;
   }
   try {
     supabaseClient = window.supabase.createClient(url, anonKey, {
+      global: { fetch: fetchWithTimeout },
       auth: {
         persistSession: false,
         autoRefreshToken: false
@@ -88,6 +111,7 @@ export function initSupabaseClient(url, anonKey) {
     return supabaseClient;
   } catch (e) {
     console.error('Init Supabase client failed:', e);
+    supabaseClient = null;
     return null;
   }
 }
@@ -102,6 +126,7 @@ export async function testSupabaseConnection(url, anonKey) {
 
   try {
     const testClient = window.supabase.createClient(url, anonKey, {
+      global: { fetch: fetchWithTimeout },
       auth: { persistSession: false }
     });
 
@@ -112,26 +137,14 @@ export async function testSupabaseConnection(url, anonKey) {
 
     if (error) {
       // 테이블이 아직 생성되지 않은 경우 (404, 42P01 등)
-      if (error.code === '42P01' || error.message?.includes('relation') || error.message?.includes('does not exist') || error.code === 'PGRST116' || error.message?.includes('404')) {
+      if (error.code === 'PGRST205' || error.code === '42P01' || error.message?.includes('relation') || error.message?.includes('does not exist') || error.code === 'PGRST116' || error.message?.includes('404')) {
         return {
-          success: true,
+          success: false,
           tableMissing: true,
-          message: 'Supabase 프로젝트 키 인증 성공! (단, 데이터베이스 테이블이 아직 생성되지 않았습니다. 관리자 모드의 [SQL 전체 복사]를 눌러 Supabase SQL Editor에서 실행해 주세요.)'
+          message: '독서일지 데이터베이스 테이블을 찾을 수 없습니다. ( 관리자 모드의 [SQL 전체 복사]를 눌러 Supabase SQL Editor에서 실행해 주세요.)'
         };
       }
       
-      // Auth 헬스체크로 2차 검증
-      try {
-        const { error: authErr } = await testClient.auth.getSession();
-        if (!authErr) {
-          return {
-            success: true,
-            tableMissing: true,
-            message: 'Supabase 서버 연결 성공! (SQL 스키마를 Supabase SQL Editor에서 실행해 주세요.)'
-          };
-        }
-      } catch {}
-
       return { success: false, message: `Supabase 연결 에러: ${error.message} (${error.code || ''})` };
     }
 
@@ -144,3 +157,4 @@ export async function testSupabaseConnection(url, anonKey) {
     return { success: false, message: `연결 테스트 중 예외 발생: ${err.message}` };
   }
 }
+

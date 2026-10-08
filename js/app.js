@@ -15,6 +15,12 @@ import {
   saveTemplate,
   getReadingLogs,
   createReadingLog,
+  updateReadingLog,
+  generateUUID,
+  exportReadingLogBackup,
+  importReadingLogBackup,
+  getStorageWarnings,
+  isCloudConfigured,
   deleteReadingLog,
   toggleLikeReadingLog,
   isLogLikedByUser,
@@ -30,6 +36,11 @@ import {
 } from './supabase.js';
 
 import { exportLogsToExcel, exportLogsToCSV } from './exportUtils.js';
+import { parseBackupJSON, downloadBackup, MAX_BACKUP_BYTES } from './backup.js';
+
+function cachedValue(key) {
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
 
 // 관리자 인증용 SHA-256 해시값 (평문 비밀번호는 코드에 저장되지 않음)
 const ADMIN_PASSWORD_HASH = '060cdc2ea278db21c67e6dba9c674ad9471a7ac5a29e120ee72942ee4aa7bdfe';
@@ -46,9 +57,13 @@ const state = {
   selectedSessionId: 'all',
   searchQuery: '',
   sortBy: 'latest', // 'latest', 'student_id', 'likes', 'oldest'
-  
+
   // 모달 상태
   isFormModalOpen: false,
+  isSubmitting: false,
+  pendingSubmissionId: null,
+  backupBusy: false,
+  pendingBackup: null,
   isDetailModalOpen: false,
   selectedLog: null,
   editingLogId: null, // 일지 수정 대상 ID (null이면 새 작성)
@@ -68,7 +83,7 @@ const state = {
     logId: null,
     action: null // 'edit' 또는 'delete'
   },
-  
+
   // 관리자 상태
   isAdmin: false,
   isAdminLoginModalOpen: false,
@@ -78,52 +93,43 @@ const state = {
   adminLogFilterSession: 'all',
   adminLogSort: 'latest', // 'latest', 'student_id', 'name', 'likes', 'oldest'
   adminLogSearch: '',
-  
+
   // Supabase 상태
   isSupabaseConfigOpen: false,
   supabaseConfig: getSupabaseConfig(),
   supabaseConnected: false,
   supabaseEditMode: false,
-  
+
   // 템플릿 빌더 임시 상태
   editingTemplate: null,
-  
+
   // 학생 캐시 정보
   studentCache: {
-    student_id: localStorage.getItem('cached_student_id') || '',
-    name: localStorage.getItem('cached_student_name') || ''
+    student_id: cachedValue('cached_student_id'),
+    name: cachedValue('cached_student_name')
   }
 };
 
 // ==========================================
 // 초기화 및 데이터 로드
 // ==========================================
+let realtimeChannel = null;
+let refreshTimer;
+function scheduleLogRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => refreshLogs().catch(error => showToast('error', error.message)), 200);
+}
+function bindRealtime() {
+  if (realtimeChannel) realtimeChannel.unsubscribe();
+  realtimeChannel = subscribeToRealtimeLogs(scheduleLogRefresh, scheduleLogRefresh, scheduleLogRefresh);
+}
 export async function initApp() {
   await refreshAllData();
-  
-  // Supabase 실시간 구독 설정
-  subscribeToRealtimeLogs(
-    newLog => {
-      showToast('info', `새로운 독서일지가 등록되었습니다: ${newLog.content?.field_book || '도서'}`);
-      refreshLogs();
-    },
-    updatedLog => {
-      refreshLogs();
-    },
-    deletedLog => {
-      refreshLogs();
-    }
-  );
-
-  // Supabase 연결 상태 체크
+  bindRealtime();
   if (state.supabaseConfig.url && state.supabaseConfig.anonKey) {
-    checkSupabaseStatus();
+    checkSupabaseStatus().catch(error => showToast('error', error.message));
   }
-
-  // 이벤트 리스너 바인딩
   bindGlobalEvents();
-
-  // 초기 화면 렌더링
   renderApp();
 }
 
@@ -144,10 +150,23 @@ async function refreshAllData() {
   state.editingTemplate = JSON.parse(JSON.stringify(template));
 }
 
+let logRefreshVersion = 0;
 async function refreshLogs() {
-  state.logs = await getReadingLogs(state.selectedTrackId, state.selectedSessionId);
+  const version = ++logRefreshVersion;
+  const logs = await getReadingLogs();
+  if (version !== logRefreshVersion) return;
+  state.logs = logs;
   renderFeed();
   renderStats();
+  renderStorageNotice();
+}
+
+function renderStorageNotice() {
+  const el = document.getElementById('storage-notice');
+  if (!el) return;
+  const message = getStorageWarnings()[0] || '';
+  el.textContent = message;
+  el.classList.toggle('hidden', !message);
 }
 
 async function checkSupabaseStatus() {
@@ -157,7 +176,7 @@ async function checkSupabaseStatus() {
     return;
   }
   const result = await testSupabaseConnection(state.supabaseConfig.url, state.supabaseConfig.anonKey);
-  state.supabaseConnected = result.success;
+  state.supabaseConnected = result.success && !result.tableMissing && getStorageWarnings().length === 0;
   updateSupabaseBadge();
 }
 
@@ -166,12 +185,13 @@ async function checkSupabaseStatus() {
 // ==========================================
 export function renderApp() {
   renderNavbar();
+  renderStorageNotice();
   renderTrackSelector();
   renderSessionFilter();
   renderFeed();
   renderStats();
   renderModals();
-  lucide.createIcons();
+  window.lucide?.createIcons();
 }
 
 function renderStats() {
@@ -197,7 +217,7 @@ function renderNavbar() {
     <header class="glass-nav sticky top-0 z-30 transition-all">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="flex items-center justify-between h-16 sm:h-20">
-          
+
           <!-- Logo & Title -->
           <div class="flex items-center gap-3 cursor-pointer" id="nav-logo-btn">
             <div class="w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-purple-500 flex items-center justify-center text-white shadow-md shadow-indigo-200">
@@ -218,7 +238,7 @@ function renderNavbar() {
 
           <!-- Right Actions -->
           <div class="flex items-center gap-2 sm:gap-3">
-            
+
             <!-- Supabase Status Button -->
             <button id="btn-supabase-status" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
               isConfigured && connected
@@ -270,7 +290,7 @@ function renderNavbar() {
 
 function updateSupabaseBadge() {
   renderNavbar();
-  lucide.createIcons();
+  window.lucide?.createIcons();
 }
 
 function renderTrackSelector() {
@@ -298,10 +318,10 @@ function renderTrackSelector() {
 
       <!-- Scrollable Track Pill Buttons -->
       <div class="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none snap-x">
-        
+
         <!-- All Tracks Button -->
-        <button 
-          data-track-id="all" 
+        <button
+          data-track-id="all"
           class="track-btn shrink-0 snap-start inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
             isAllActive
               ? 'bg-slate-900 text-white shadow-md shadow-slate-300 ring-2 ring-slate-900 ring-offset-2'
@@ -321,8 +341,8 @@ function renderTrackSelector() {
     const trackColor = track.color || '#4F46E5';
 
     html += `
-      <button 
-        data-track-id="${track.id}" 
+      <button
+        data-track-id="${track.id}"
         style="${isActive ? `background-color: ${trackColor}; color: white; box-shadow: 0 4px 12px ${trackColor}40;` : ''}"
         class="track-btn shrink-0 snap-start inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
           isActive
@@ -330,7 +350,7 @@ function renderTrackSelector() {
             : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 hover:border-slate-300'
         }">
         <i data-lucide="${getIconForTrack(track.name, track.icon)}" class="w-4 h-4 ${isActive ? 'text-white' : ''}" style="${!isActive ? `color: ${trackColor}` : ''}"></i>
-        <span>${track.name}</span>
+        <span>${escapeHtml(track.name)}</span>
         <span class="px-1.5 py-0.5 rounded-full text-xs font-medium ${
           isActive ? 'bg-white/25 text-white' : 'bg-slate-100 text-slate-600'
         }">${count}</span>
@@ -354,7 +374,7 @@ function renderSessionFilter() {
 
   let html = `
     <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 p-4 rounded-2xl bg-white border border-slate-200 shadow-sm mb-6">
-      
+
       <!-- Session Tabs -->
       <div class="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0">
         <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider mr-1 shrink-0 flex items-center gap-1">
@@ -362,7 +382,7 @@ function renderSessionFilter() {
         </span>
 
         <!-- All Sessions -->
-        <button 
+        <button
           data-session-id="all"
           class="session-btn px-3 py-1.5 rounded-lg text-xs font-semibold transition-all shrink-0 ${
             isAllSessions
@@ -376,7 +396,7 @@ function renderSessionFilter() {
   state.sessions.forEach(sess => {
     const isActive = state.selectedSessionId === sess.id;
     html += `
-      <button 
+      <button
         data-session-id="${sess.id}"
         class="session-btn px-3 py-1.5 rounded-lg text-xs font-semibold transition-all shrink-0 flex items-center gap-1.5 ${
           isActive
@@ -394,15 +414,15 @@ function renderSessionFilter() {
 
       <!-- Search & Sort Controls -->
       <div class="flex items-center gap-2 shrink-0">
-        
+
         <!-- Search Input -->
         <div class="relative flex-1 md:w-64">
           <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
-          <input 
-            type="text" 
-            id="search-input" 
+          <input
+            type="text"
+            id="search-input"
             value="${state.searchQuery}"
-            placeholder="도서명, 저자, 학생명 검색..." 
+            placeholder="도서명, 저자, 학생명 검색..."
             class="w-full pl-9 pr-8 py-1.5 text-xs sm:text-sm bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all"
           />
           ${state.searchQuery ? `
@@ -446,13 +466,13 @@ function renderFeed() {
   if (state.searchQuery.trim()) {
     const q = state.searchQuery.toLowerCase().trim();
     filtered = filtered.filter(l => {
-      const book = (l.content?.field_book || '').toLowerCase();
-      const author = (l.content?.field_author || '').toLowerCase();
-      const studentName = (l.student_info?.name || '').toLowerCase();
-      const studentId = (l.student_info?.student_id || '').toLowerCase();
-      const quote = (l.content?.field_quote || '').toLowerCase();
-      const career = (l.content?.field_career || '').toLowerCase();
-      const keywords = (l.content?.field_keywords || '').toLowerCase();
+      const book = (l.content?.field_book || '').toString().toLowerCase();
+      const author = (l.content?.field_author || '').toString().toLowerCase();
+      const studentName = (l.student_info?.name || '').toString().toLowerCase();
+      const studentId = (l.student_info?.student_id || '').toString().toLowerCase();
+      const quote = (l.content?.field_quote || '').toString().toLowerCase();
+      const career = (l.content?.field_career || '').toString().toLowerCase();
+      const keywords = (l.content?.field_keywords || '').toString().toLowerCase();
 
       return book.includes(q) || author.includes(q) || studentName.includes(q) || studentId.includes(q) || quote.includes(q) || career.includes(q) || keywords.includes(q);
     });
@@ -493,7 +513,7 @@ function renderFeed() {
         </div>
         <h3 class="text-lg font-bold text-slate-800 mb-1">등록된 독서일지가 없습니다</h3>
         <p class="text-sm text-slate-500 max-w-md mx-auto mb-6">
-          ${state.searchQuery ? `'${state.searchQuery}' 검색 조건에 해당하는 일지가 없습니다.` : '선택한 계열 및 차시에 첫 번째 독서일지를 작성해 보세요!'}
+          ${state.searchQuery ? `'${escapeHtml(state.searchQuery)}' 검색 조건에 해당하는 일지가 없습니다.` : '선택한 계열 및 차시에 첫 번째 독서일지를 작성해 보세요!'}
         </p>
         <button id="btn-empty-write" class="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-white bg-indigo-600 hover:bg-indigo-700 shadow-md shadow-indigo-200 transition-all">
           <i data-lucide="plus-circle" class="w-4 h-4"></i>
@@ -501,7 +521,7 @@ function renderFeed() {
         </button>
       </div>
     `;
-    lucide.createIcons();
+    window.lucide?.createIcons();
     return;
   }
 
@@ -520,22 +540,22 @@ function renderFeed() {
     const quote = content.field_quote || '';
     const career = content.field_career || '';
     const rating = Number(content.field_rating) || 0;
-    const keywords = content.field_keywords ? content.field_keywords.split(',').map(k => k.trim()).filter(Boolean) : [];
+    const keywords = content.field_keywords ? String(content.field_keywords).split(',').map(k => k.trim()).filter(Boolean) : [];
     const isLiked = isLogLikedByUser(log.id);
 
     const formattedDate = formatRelativeTime(log.created_at);
 
     html += `
       <div class="glass-card rounded-2xl p-5 flex flex-col justify-between cursor-pointer group hover:border-indigo-200 animate-fade-in relative" data-log-card-id="${log.id}">
-        
+
         <div>
           <!-- Top Row: Track Badge & Session Tag -->
           <div class="flex items-center justify-between gap-2 mb-3">
             <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold" style="background-color: ${track.color}15; color: ${track.color}; border: 1px solid ${track.color}30;">
               <span class="w-1.5 h-1.5 rounded-full" style="background-color: ${track.color}"></span>
-              ${track.name}
+              ${escapeHtml(track.name)}
             </span>
-            <span class="text-xs text-slate-400 font-medium">${session.title?.split(':')[0] || '차시'}</span>
+            <span class="text-xs text-slate-400 font-medium">${escapeHtml(session.title?.split(':')[0] || '차시')}</span>
           </div>
 
           <!-- Book Title & Author -->
@@ -588,7 +608,7 @@ function renderFeed() {
 
         <!-- Card Footer -->
         <div class="pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
-          
+
           <!-- Student Info -->
           <div class="flex items-center gap-2">
             <div class="w-7 h-7 rounded-full bg-gradient-to-tr from-slate-700 to-slate-900 text-white flex items-center justify-center font-bold text-[11px]">
@@ -603,8 +623,8 @@ function renderFeed() {
           <!-- Likes & Date -->
           <div class="flex items-center gap-3">
             <span class="text-[11px] text-slate-400">${formattedDate}</span>
-            <button 
-              data-like-log-id="${log.id}" 
+            <button
+              data-like-log-id="${log.id}"
               class="like-btn inline-flex items-center gap-1 px-2 py-1 rounded-lg transition-all ${
                 isLiked
                   ? 'bg-rose-50 text-rose-600 font-bold'
@@ -623,7 +643,7 @@ function renderFeed() {
 
   html += `</div>`;
   container.innerHTML = html;
-  lucide.createIcons();
+  window.lucide?.createIcons();
 }
 
 function renderModals() {
@@ -634,6 +654,7 @@ function renderModals() {
   renderAdminModal();
   renderMoveLogModal();
   renderSupabaseConfigModal();
+  protectAsyncHandlers(document);
 }
 
 /**
@@ -645,17 +666,23 @@ function renderFormModal() {
 
   if (!state.isFormModalOpen) {
     modal.classList.add('hidden');
+    modal.replaceChildren();
+    delete modal.dataset.formKey;
     return;
   }
 
   modal.classList.remove('hidden');
+  const formKey = state.editingLogId || 'new';
+  if (modal.dataset.formKey === formKey && modal.querySelector('form')) return;
+  modal.dataset.formKey = formKey;
 
   const isEditing = Boolean(state.editingLogId);
   const editingLog = isEditing ? state.logs.find(l => l.id === state.editingLogId) : null;
 
   const template = state.activeTemplate || { fields: [] };
   const currentTrackId = editingLog ? editingLog.track_id : (state.selectedTrackId !== 'all' ? state.selectedTrackId : (state.tracks[0]?.id || ''));
-  const currentSessionId = editingLog ? editingLog.session_id : (state.selectedSessionId !== 'all' ? state.selectedSessionId : (state.sessions[0]?.id || ''));
+  const availableSessions = state.sessions.filter(s => state.isAdmin || s.is_active || (editingLog && s.id === editingLog.session_id));
+  const currentSessionId = editingLog ? editingLog.session_id : (availableSessions.some(s => s.id === state.selectedSessionId) ? state.selectedSessionId : (availableSessions[0]?.id || ''));
   const studentInfo = editingLog ? editingLog.student_info : state.studentCache;
   const contentData = editingLog?.content || {};
 
@@ -671,8 +698,8 @@ function renderFormModal() {
           <label class="block text-xs sm:text-sm font-semibold text-slate-800">
             ${escapeHtml(field.label)} ${reqBadge}
           </label>
-          <textarea 
-            name="${field.id}" 
+          <textarea
+            name="${escapeHtml(field.id)}"
             rows="3"
             ${isRequired ? 'required' : ''}
             placeholder="${escapeHtml(field.placeholder || '')}"
@@ -687,16 +714,16 @@ function renderFormModal() {
           <label class="block text-xs sm:text-sm font-semibold text-slate-800">
             ${escapeHtml(field.label)} ${reqBadge}
           </label>
-          <div class="flex items-center gap-2" id="star-rating-group">
-            <input type="hidden" name="${field.id}" id="input-star-rating" value="${initialRating}" />
-            <div class="flex items-center gap-1 text-2xl text-amber-400 cursor-pointer" id="star-container">
+          <div class="flex items-center gap-2" data-rating-group>
+            <input type="hidden" name="${escapeHtml(field.id)}" data-rating-input value="${initialRating}" />
+            <div class="flex items-center gap-1 text-2xl text-amber-400 cursor-pointer" data-rating-stars>
               ${[1, 2, 3, 4, 5].map(star => `
                 <button type="button" data-star-val="${star}" class="star-rating-star ${star <= initialRating ? 'text-amber-400' : 'text-slate-200'} hover:scale-110 transition-transform">
                   ★
                 </button>
               `).join('')}
             </div>
-            <span class="text-xs font-bold text-slate-600 ml-2" id="star-rating-text">${initialRating}점</span>
+            <span class="text-xs font-bold text-slate-600 ml-2" data-rating-text>${initialRating}점</span>
           </div>
         </div>
       `;
@@ -706,9 +733,9 @@ function renderFormModal() {
           <label class="block text-xs sm:text-sm font-semibold text-slate-800">
             ${escapeHtml(field.label)} ${reqBadge}
           </label>
-          <input 
-            type="${field.type === 'number' ? 'number' : 'text'}" 
-            name="${field.id}"
+          <input
+            type="${field.type === 'number' ? 'number' : 'text'}" ${field.type === 'number' ? 'step="any"' : ''}
+            name="${escapeHtml(field.id)}"
             value="${escapeHtml(val)}"
             ${isRequired ? 'required' : ''}
             placeholder="${escapeHtml(field.placeholder || '')}"
@@ -722,7 +749,7 @@ function renderFormModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 overflow-y-auto bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-2xl rounded-3xl overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]">
-        
+
         <!-- Modal Header -->
         <div class="px-6 py-5 bg-gradient-to-r ${isEditing ? 'from-purple-600 to-indigo-700' : 'from-indigo-600 to-indigo-700'} text-white flex items-center justify-between shrink-0">
           <div class="flex items-center gap-3">
@@ -741,7 +768,7 @@ function renderFormModal() {
 
         <!-- Form Body -->
         <form id="reading-log-form" class="p-6 overflow-y-auto space-y-5 flex-1">
-          
+
           <!-- Student Info & Track / Session Row -->
           <div class="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 space-y-4">
             <div class="text-xs font-bold text-indigo-900 uppercase tracking-wider flex items-center gap-1.5">
@@ -754,12 +781,12 @@ function renderFormModal() {
                 <label class="block text-xs font-semibold text-slate-700 mb-1">
                   학번 (예: 20315) <span class="text-rose-500">*</span>
                 </label>
-                <input 
-                  type="text" 
-                  id="form-student-id" 
-                  required 
+                <input
+                  type="text"
+                  id="form-student-id"
+                  required
                   value="${escapeHtml(studentInfo.student_id || '')}"
-                  placeholder="5자리 학번" 
+                  placeholder="5자리 학번"
                   class="w-full px-3 py-2 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
               </div>
@@ -767,12 +794,12 @@ function renderFormModal() {
                 <label class="block text-xs font-semibold text-slate-700 mb-1">
                   이름 <span class="text-rose-500">*</span>
                 </label>
-                <input 
-                  type="text" 
-                  id="form-student-name" 
-                  required 
+                <input
+                  type="text"
+                  id="form-student-name"
+                  required
                   value="${escapeHtml(studentInfo.name || '')}"
-                  placeholder="이름 입력" 
+                  placeholder="이름 입력"
                   class="w-full px-3 py-2 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
               </div>
@@ -780,14 +807,14 @@ function renderFormModal() {
                 <label class="block text-xs font-semibold text-slate-700 mb-1">
                   ${isEditing ? '비밀번호 변경 (선택)' : '비밀번호 (숫자 4자리) <span class="text-rose-500">*</span>'}
                 </label>
-                <input 
-                  type="password" 
-                  id="form-student-pin" 
+                <input
+                  type="password"
+                  id="form-student-pin"
                   ${isEditing ? '' : 'required'}
-                  maxlength="4" 
-                  pattern="[0-9]{4}" 
-                  inputmode="numeric" 
-                  placeholder="${isEditing ? '미입력시 기존유지' : '숫자 4자리'}" 
+                  maxlength="4"
+                  pattern="[0-9]{4}"
+                  inputmode="numeric"
+                  placeholder="${isEditing ? '미입력시 기존유지' : '숫자 4자리'}"
                   class="w-full px-3 py-2 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
                   title="일지 수정 및 삭제 시 본인 확인을 위한 숫자 4자리 비밀번호"
                 />
@@ -807,7 +834,7 @@ function renderFormModal() {
                 </label>
                 <select id="form-track-id" required class="w-full px-3 py-2 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium">
                   ${state.tracks.map(t => `
-                    <option value="${t.id}" ${t.id === currentTrackId ? 'selected' : ''}>${t.name}</option>
+                    <option value="${t.id}" ${t.id === currentTrackId ? 'selected' : ''}>${escapeHtml(t.name)}</option>
                   `).join('')}
                 </select>
               </div>
@@ -816,8 +843,8 @@ function renderFormModal() {
                   활동 차시 <span class="text-rose-500">*</span>
                 </label>
                 <select id="form-session-id" required class="w-full px-3 py-2 text-sm bg-white rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium">
-                  ${state.sessions.map(s => `
-                    <option value="${s.id}" ${s.id === currentSessionId ? 'selected' : ''}>${s.title} (${s.date})</option>
+                  ${availableSessions.map(s => `
+                    <option value="${s.id}" ${s.id === currentSessionId ? 'selected' : ''}>${escapeHtml(s.title)} (${s.date})${s.is_active ? '' : ' · 마감'}</option>
                   `).join('')}
                 </select>
               </div>
@@ -850,8 +877,9 @@ function renderFormModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindFormModalEvents();
+  protectAsyncHandlers(modal);
 }
 
 /**
@@ -888,16 +916,16 @@ function renderDetailModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 overflow-y-auto bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-3xl rounded-3xl overflow-hidden shadow-2xl border border-slate-100 flex flex-col max-h-[90vh]">
-        
+
         <!-- Header -->
         <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between shrink-0 bg-white">
           <div class="flex items-center gap-2">
             <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold" style="background-color: ${track.color}15; color: ${track.color}; border: 1px solid ${track.color}30;">
               <span class="w-2 h-2 rounded-full" style="background-color: ${track.color}"></span>
-              ${track.name}
+              ${escapeHtml(track.name)}
             </span>
             <span class="text-xs font-semibold text-slate-500 px-2.5 py-1 bg-slate-100 rounded-lg">
-              ${session.title}
+              ${escapeHtml(session.title)}
             </span>
           </div>
 
@@ -936,7 +964,7 @@ function renderDetailModal() {
 
         <!-- Content Body -->
         <div class="p-6 sm:p-8 overflow-y-auto space-y-6 flex-1 bg-slate-50/50" id="print-content-area">
-          
+
           <!-- Book Hero Section -->
           <div class="p-6 rounded-2xl bg-white border border-slate-200 shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div>
@@ -973,7 +1001,7 @@ function renderDetailModal() {
             ${template.fields.map(f => {
               if (f.id === 'field_book' || f.id === 'field_author' || f.id === 'field_pages') return '';
               const val = content[f.id];
-              if (!val) return '';
+              if (val === undefined || val === null || val === '') return '';
 
               if (f.type === 'rating') {
                 const ratingNum = Number(val) || 0;
@@ -1030,11 +1058,11 @@ function renderDetailModal() {
 
         <!-- Modal Footer with Like CTA -->
         <div class="px-6 py-4 bg-white border-t border-slate-100 flex items-center justify-between shrink-0">
-          <button 
+          <button
             data-detail-like-id="${log.id}"
             class="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all ${
-              isLiked 
-                ? 'bg-rose-50 text-rose-600 border border-rose-200' 
+              isLiked
+                ? 'bg-rose-50 text-rose-600 border border-rose-200'
                 : 'bg-slate-50 text-slate-700 hover:bg-rose-50 hover:text-rose-600 border border-slate-200'
             }">
             <i data-lucide="heart" class="w-4 h-4 ${isLiked ? 'fill-rose-500 text-rose-500' : ''}"></i>
@@ -1050,8 +1078,9 @@ function renderDetailModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindDetailModalEvents();
+  protectAsyncHandlers(modal);
 }
 
 /**
@@ -1076,7 +1105,7 @@ function renderAuthPinModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-md rounded-3xl overflow-hidden shadow-2xl border border-slate-100 p-6 sm:p-8">
-        
+
         <div class="w-12 h-12 rounded-2xl ${isEdit ? 'bg-indigo-100 text-indigo-600' : 'bg-rose-100 text-rose-600'} flex items-center justify-center mx-auto mb-4">
           <i data-lucide="${isEdit ? 'key-round' : 'trash-2'}" class="w-6 h-6"></i>
         </div>
@@ -1091,15 +1120,15 @@ function renderAuthPinModal() {
         <form id="auth-pin-form" class="space-y-4">
           <div>
             <label class="block text-xs font-semibold text-slate-700 mb-1.5">비밀번호 (숫자 4자리)</label>
-            <input 
-              type="password" 
-              id="auth-pin-input" 
-              required 
+            <input
+              type="password"
+              id="auth-pin-input"
+              required
               autofocus
               maxlength="4"
               pattern="[0-9]{4}"
               inputmode="numeric"
-              placeholder="••••" 
+              placeholder="••••"
               class="w-full text-center tracking-widest text-xl font-mono py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 ${isEdit ? 'focus:ring-indigo-500' : 'focus:ring-rose-500'}"
             />
           </div>
@@ -1118,8 +1147,9 @@ function renderAuthPinModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindAuthPinModalEvents();
+  protectAsyncHandlers(modal);
 }
 
 /**
@@ -1138,7 +1168,7 @@ function renderAdminLoginModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-md rounded-3xl overflow-hidden shadow-2xl border border-slate-100 p-6 sm:p-8">
-        
+
         <div class="w-12 h-12 rounded-2xl bg-purple-100 text-purple-600 flex items-center justify-center mx-auto mb-4">
           <i data-lucide="shield" class="w-6 h-6"></i>
         </div>
@@ -1149,12 +1179,12 @@ function renderAdminLoginModal() {
         <form id="admin-login-form" class="space-y-4">
           <div>
             <label class="block text-xs font-semibold text-slate-700 mb-1.5">관리자 비밀번호</label>
-            <input 
-              type="password" 
-              id="admin-password-input" 
-              required 
+            <input
+              type="password"
+              id="admin-password-input"
+              required
               autofocus
-              placeholder="관리자 비밀번호를 입력하세요" 
+              placeholder="관리자 비밀번호를 입력하세요"
               class="w-full px-4 py-2.5 text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
             />
           </div>
@@ -1178,8 +1208,9 @@ function renderAdminLoginModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindAdminLoginEvents();
+  protectAsyncHandlers(modal);
 }
 
 /**
@@ -1201,7 +1232,7 @@ function renderAdminModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 overflow-y-auto bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-5xl rounded-3xl overflow-hidden shadow-2xl border border-slate-100 flex flex-col h-[90vh]">
-        
+
         <!-- Admin Top Header -->
         <div class="px-6 py-4 bg-slate-900 text-white flex items-center justify-between shrink-0">
           <div class="flex items-center gap-3">
@@ -1238,6 +1269,9 @@ function renderAdminModal() {
           <button data-admin-tab="sessions" class="admin-tab-btn px-4 py-3 text-xs sm:text-sm font-semibold border-b-2 transition-all shrink-0 ${tab === 'sessions' ? 'border-purple-600 text-purple-700 bg-white shadow-sm' : 'border-transparent text-slate-600 hover:text-slate-900'}">
             <i data-lucide="calendar" class="w-4 h-4 inline mr-1"></i> 활동 차시 관리
           </button>
+          <button data-admin-tab="backup" class="admin-tab-btn px-4 py-3 text-xs sm:text-sm font-semibold border-b-2 shrink-0 ${tab === 'backup' ? 'border-purple-600 text-purple-700 bg-white' : 'border-transparent text-slate-600'}">
+            <i data-lucide="archive" class="w-4 h-4 inline mr-1"></i> JSON 백업 & 불러오기
+          </button>
           <button data-admin-tab="supabase" class="admin-tab-btn px-4 py-3 text-xs sm:text-sm font-semibold border-b-2 transition-all shrink-0 ${tab === 'supabase' ? 'border-purple-600 text-purple-700 bg-white shadow-sm' : 'border-transparent text-slate-600 hover:text-slate-900'}">
             <i data-lucide="database" class="w-4 h-4 inline mr-1"></i> Supabase 연동 & SQL
           </button>
@@ -1252,8 +1286,9 @@ function renderAdminModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindAdminModalEvents();
+  protectAsyncHandlers(document.getElementById('admin-dashboard-modal'));
 }
 
 function renderAdminTabContent(tab) {
@@ -1265,6 +1300,8 @@ function renderAdminTabContent(tab) {
     return renderAdminTracksTab();
   } else if (tab === 'sessions') {
     return renderAdminSessionsTab();
+  } else if (tab === 'backup') {
+    return renderAdminBackupTab();
   } else if (tab === 'supabase') {
     return renderAdminSupabaseTab();
   }
@@ -1274,6 +1311,25 @@ function renderAdminTabContent(tab) {
 /**
  * 1. 관리자 - 일지 관리 및 엑셀 다운로드 탭 (계열별 / 차시별 필터링 지원)
  */
+function renderAdminBackupTab() {
+  const count = state.pendingBackup?.data.reading_logs.length;
+  return `<div class="space-y-5">
+    <div class="p-5 bg-white rounded-2xl border border-slate-200 space-y-3">
+      <h3 class="text-lg font-bold">독서일지 JSON 백업</h3>
+      <p class="text-sm text-slate-600">현재 ${isCloudConfigured() ? '서버' : '이 브라우저'}의 전체 일지와 진로 계열, 차시, 양식을 함께 저장합니다. 목록 필터와 관계없이 전체 데이터를 백업합니다.</p>
+      <p class="text-xs text-slate-500">학생 이름·학번과 수정용 비밀번호 해시가 포함됩니다. 백업 파일은 선생님이 안전하게 보관해 주세요.</p>
+      <button id="btn-export-json" ${state.backupBusy ? 'disabled' : ''} class="px-5 py-2.5 rounded-xl bg-purple-600 text-white font-semibold disabled:opacity-50">JSON 파일로 백업</button>
+    </div>
+    <div class="p-5 bg-white rounded-2xl border border-slate-200 space-y-3">
+      <h3 class="text-lg font-bold">백업 파일 불러오기</h3>
+      <p class="text-sm text-slate-600">이 앱에서 만든 JSON 파일(최대 20MB)을 선택하세요. 같은 ID의 일지는 건너뛰고 없는 일지만 추가합니다. 현재 일지와 기존 계열·차시·양식 설정을 유지합니다.</p>
+      <input id="backup-json-file" type="file" accept=".json,application/json" ${state.backupBusy ? 'disabled' : ''} class="block w-full text-sm" />
+      <p id="backup-file-status" role="status" class="text-sm text-slate-700">${count === undefined ? '불러올 파일을 선택해 주세요.' : `검증 완료: 독서일지 ${count}건 (중복 항목은 건너뜁니다).`}</p>
+      <button id="btn-import-json" ${state.backupBusy || !state.pendingBackup ? 'disabled' : ''} class="px-5 py-2.5 rounded-xl bg-indigo-600 text-white font-semibold disabled:opacity-50">${state.backupBusy ? '처리 중...' : '확인한 데이터 불러오기'}</button>
+    </div>
+  </div>`;
+}
+
 function renderAdminLogsTab() {
   const totalCount = state.logs.length;
   const trackMap = new Map(state.tracks.map(t => [t.id, t.name]));
@@ -1293,10 +1349,10 @@ function renderAdminLogsTab() {
   if (state.adminLogSearch && state.adminLogSearch.trim()) {
     const q = state.adminLogSearch.toLowerCase().trim();
     filteredLogs = filteredLogs.filter(l => {
-      const book = (l.content?.field_book || '').toLowerCase();
-      const author = (l.content?.field_author || '').toLowerCase();
-      const name = (l.student_info?.name || '').toLowerCase();
-      const studentId = (l.student_info?.student_id || '').toLowerCase();
+      const book = (l.content?.field_book || '').toString().toLowerCase();
+      const author = (l.content?.field_author || '').toString().toLowerCase();
+      const name = (l.student_info?.name || '').toString().toLowerCase();
+      const studentId = (l.student_info?.student_id || '').toString().toLowerCase();
       return book.includes(q) || author.includes(q) || name.includes(q) || studentId.includes(q);
     });
   }
@@ -1331,10 +1387,10 @@ function renderAdminLogsTab() {
 
   return `
     <div class="space-y-6">
-      
+
       <!-- Top Filter & Action Bar -->
       <div class="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm space-y-4">
-        
+
         <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
             <div class="flex items-center gap-2">
@@ -1361,14 +1417,14 @@ function renderAdminLogsTab() {
 
         <!-- Filter Dropdowns & Search Row -->
         <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-3 border-t border-slate-100">
-          
+
           <!-- Career Track Filter -->
           <div class="sm:col-span-3">
             <label class="block text-xs font-semibold text-slate-600 mb-1">진로 계열 필터</label>
             <select id="admin-filter-track-select" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
               <option value="all" ${state.adminLogFilterTrack === 'all' ? 'selected' : ''}>전체 진로 계열</option>
               ${state.tracks.map(t => `
-                <option value="${t.id}" ${state.adminLogFilterTrack === t.id ? 'selected' : ''}>${t.name}</option>
+                <option value="${t.id}" ${state.adminLogFilterTrack === t.id ? 'selected' : ''}>${escapeHtml(t.name)}</option>
               `).join('')}
             </select>
           </div>
@@ -1379,7 +1435,7 @@ function renderAdminLogsTab() {
             <select id="admin-filter-session-select" class="w-full px-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500 font-medium">
               <option value="all" ${state.adminLogFilterSession === 'all' ? 'selected' : ''}>전체 활동 차시</option>
               ${state.sessions.map(s => `
-                <option value="${s.id}" ${state.adminLogFilterSession === s.id ? 'selected' : ''}>${s.title}</option>
+                <option value="${s.id}" ${state.adminLogFilterSession === s.id ? 'selected' : ''}>${escapeHtml(s.title)}</option>
               `).join('')}
             </select>
           </div>
@@ -1401,11 +1457,11 @@ function renderAdminLogsTab() {
             <label class="block text-xs font-semibold text-slate-600 mb-1">학생명 / 학번 / 도서명 검색</label>
             <div class="relative">
               <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
-              <input 
-                type="text" 
-                id="admin-filter-search-input" 
+              <input
+                type="text"
+                id="admin-filter-search-input"
                 value="${escapeHtml(state.adminLogSearch)}"
-                placeholder="검색어 입력..." 
+                placeholder="검색어 입력..."
                 class="w-full pl-9 pr-3 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-purple-500"
               />
             </div>
@@ -1450,7 +1506,7 @@ function renderAdminLogsTab() {
                     </span>
                   </td>
                   <td class="py-3.5 px-4 text-xs text-slate-600 whitespace-nowrap">
-                    ${sessionMap.get(log.session_id)?.split(':')[0] || '차시'}
+                    ${escapeHtml(sessionMap.get(log.session_id)?.split(':')[0] || '차시')}
                   </td>
                   <td class="py-3.5 px-4 max-w-xs">
                     <span class="font-bold text-slate-800 block truncate">${escapeHtml(log.content?.field_book || '무제')}</span>
@@ -1494,7 +1550,7 @@ function renderAdminTemplateTab() {
 
   return `
     <div class="space-y-6">
-      
+
       <div class="p-4 rounded-2xl bg-white border border-slate-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h3 class="text-base font-bold text-slate-900">공통 독서 일지 작성 양식 커스터마이징</h3>
@@ -1509,10 +1565,10 @@ function renderAdminTemplateTab() {
       <!-- Template Title Input -->
       <div class="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm">
         <label class="block text-xs font-semibold text-slate-700 mb-1.5">양식 제목</label>
-        <input 
-          type="text" 
-          id="template-title-input" 
-          value="${escapeHtml(template.title || '')}" 
+        <input
+          type="text"
+          id="template-title-input"
+          value="${escapeHtml(template.title || '')}"
           class="w-full px-3.5 py-2 text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-bold"
         />
       </div>
@@ -1546,10 +1602,10 @@ function renderAdminTemplateTab() {
             <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
               <div class="sm:col-span-6">
                 <label class="block text-xs font-semibold text-slate-700 mb-1">항목명(질문)</label>
-                <input 
-                  type="text" 
-                  data-field-key="label" 
-                  value="${escapeHtml(field.label)}" 
+                <input
+                  type="text"
+                  data-field-key="label"
+                  value="${escapeHtml(field.label)}"
                   class="w-full px-3 py-1.5 text-xs sm:text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
                 />
               </div>
@@ -1574,11 +1630,11 @@ function renderAdminTemplateTab() {
 
             <div>
               <label class="block text-xs font-semibold text-slate-700 mb-1">입력 안내 힌트 (Placeholder)</label>
-              <input 
-                type="text" 
-                data-field-key="placeholder" 
-                value="${escapeHtml(field.placeholder || '')}" 
-                placeholder="학생들에게 보여줄 예시 또는 작성 팁" 
+              <input
+                type="text"
+                data-field-key="placeholder"
+                value="${escapeHtml(field.placeholder || '')}"
+                placeholder="학생들에게 보여줄 예시 또는 작성 팁"
                 class="w-full px-3 py-1.5 text-xs sm:text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
               />
             </div>
@@ -1596,7 +1652,7 @@ function renderAdminTemplateTab() {
 function renderAdminTracksTab() {
   return `
     <div class="space-y-6">
-      
+
       <!-- Track Add Form Card -->
       <div class="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm space-y-4">
         <h3 class="text-sm font-bold text-slate-900 flex items-center gap-2">
@@ -1658,7 +1714,7 @@ function renderAdminTracksTab() {
 function renderAdminSessionsTab() {
   return `
     <div class="space-y-6">
-      
+
       <!-- Session Add Form Card -->
       <div class="p-5 rounded-2xl bg-white border border-slate-200 shadow-sm space-y-4">
         <h3 class="text-sm font-bold text-slate-900 flex items-center gap-2">
@@ -1763,7 +1819,7 @@ function renderAdminSupabaseTab() {
 
   return `
     <div class="space-y-6">
-      
+
       <!-- Connection Status Banner -->
       <div class="p-5 rounded-2xl ${isConnected ? 'bg-emerald-50 border border-emerald-200' : 'bg-amber-50 border border-amber-200'}">
         <div class="flex items-start gap-3">
@@ -1772,7 +1828,7 @@ function renderAdminSupabaseTab() {
           </div>
           <div>
             <h3 class="text-sm font-bold ${isConnected ? 'text-emerald-900' : 'text-amber-900'}">
-              ${isConnected ? 'Supabase 클라우드 데이터베이스에 정상 연결되어 있습니다.' : '현재 브라우저 로컬 저장소(Mock) 모드로 작동 중입니다.'}
+              ${isConnected ? 'Supabase 클라우드 데이터베이스에 정상 연결되어 있습니다.' : (isCloudConfigured() ? '서버 연결을 확인해 주세요. 제출 실패 시 입력 내용이 유지됩니다.' : '현재 브라우저 로컬 저장소 모드로 작동 중입니다.')}
             </h3>
             <p class="text-xs ${isConnected ? 'text-emerald-700' : 'text-amber-700'} mt-1">
               ${isConnected ? '모든 학생 제출 데이터가 실시간으로 Supabase PostgreSQL DB에 안전하게 동기화됩니다.' : 'Supabase 설정 후 아래 SQL 스크립트를 Supabase SQL Editor에 실행하면 클라우드 실시간 연동이 활성화됩니다.'}
@@ -1801,11 +1857,11 @@ function renderAdminSupabaseTab() {
           <div class="space-y-3">
             <div>
               <label class="block text-xs font-semibold text-slate-700 mb-1">VITE_SUPABASE_URL (Project URL)</label>
-              <input 
-                type="password" 
-                readonly 
+              <input
+                type="password"
+                readonly
                 disabled
-                value="••••••••••••••••••••••••••••••••••••••••" 
+                value="••••••••••••••••••••••••••••••••••••••••"
                 class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-100/80 text-slate-400 font-mono select-none cursor-not-allowed pointer-events-none"
                 oncopy="return false;" oncut="return false;" oncontextmenu="return false;"
               />
@@ -1813,11 +1869,11 @@ function renderAdminSupabaseTab() {
 
             <div>
               <label class="block text-xs font-semibold text-slate-700 mb-1">VITE_SUPABASE_ANON_KEY (Public Anon Key)</label>
-              <input 
-                type="password" 
-                readonly 
+              <input
+                type="password"
+                readonly
                 disabled
-                value="••••••••••••••••••••••••••••••••••••••••••••••••••••" 
+                value="••••••••••••••••••••••••••••••••••••••••••••••••••••"
                 class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-100/80 text-slate-400 font-mono select-none cursor-not-allowed pointer-events-none"
                 oncopy="return false;" oncut="return false;" oncontextmenu="return false;"
               />
@@ -1839,22 +1895,22 @@ function renderAdminSupabaseTab() {
           <form id="supabase-config-form" class="space-y-3">
             <div>
               <label class="block text-xs font-semibold text-slate-700 mb-1">새 VITE_SUPABASE_URL 입력</label>
-              <input 
-                type="url" 
-                id="admin-supabase-url" 
+              <input
+                type="url"
+                id="admin-supabase-url"
                 required
-                placeholder="https://xxxxxxxxxxxx.supabase.co" 
+                placeholder="https://xxxxxxxxxxxx.supabase.co"
                 class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono"
               />
             </div>
 
             <div>
               <label class="block text-xs font-semibold text-slate-700 mb-1">새 VITE_SUPABASE_ANON_KEY 입력</label>
-              <input 
-                type="text" 
-                id="admin-supabase-key" 
+              <input
+                type="text"
+                id="admin-supabase-key"
                 required
-                placeholder="sb_publishable_..." 
+                placeholder="sb_publishable_..."
                 class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono"
               />
             </div>
@@ -1944,7 +2000,7 @@ DROP POLICY IF EXISTS "Allow public all reading_logs" ON reading_logs;
 CREATE POLICY "Allow public all reading_logs" ON reading_logs FOR ALL USING (true);
 
 -- 7. 초기 데이터 삽입
-INSERT INTO career_tracks (id, name, color, icon, order_num) VALUES 
+INSERT INTO career_tracks (id, name, color, icon, order_num) VALUES
 ('11111111-0001-4000-8000-000000000001', '자연과학', '#059669', 'Atom', 1),
 ('11111111-0002-4000-8000-000000000002', '공학·IT', '#2563EB', 'Cpu', 2),
 ('11111111-0003-4000-8000-000000000003', '인문·사회', '#D97706', 'BookOpen', 3),
@@ -1955,7 +2011,7 @@ INSERT INTO career_tracks (id, name, color, icon, order_num) VALUES
 ('11111111-0008-4000-8000-000000000008', '융합·자율', '#4F46E5', 'Compass', 8)
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO sessions (id, title, date, is_active) VALUES 
+INSERT INTO sessions (id, title, date, is_active) VALUES
 ('22222222-0001-4000-8000-000000000001', '1차시 : 진로 탐색 및 핵심 도서 선정', '2026-03-10', TRUE),
 ('22222222-0002-4000-8000-000000000002', '2차시 : 심화 쟁점 분석 및 비판적 읽기', '2026-03-24', TRUE),
 ('22222222-0003-4000-8000-000000000003', '3차시 : 진로 융합 탐구 및 인사이트 나눔', '2026-04-07', TRUE),
@@ -1996,7 +2052,7 @@ function renderMoveLogModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl border border-slate-100 flex flex-col">
-        
+
         <!-- Header -->
         <div class="px-6 py-5 bg-gradient-to-r from-purple-600 to-indigo-700 text-white flex items-center justify-between">
           <div class="flex items-center gap-3">
@@ -2072,8 +2128,9 @@ function renderMoveLogModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindMoveLogModalEvents();
+  protectAsyncHandlers(modal);
 }
 
 /**
@@ -2093,7 +2150,7 @@ function renderSupabaseConfigModal() {
   modal.innerHTML = `
     <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
       <div class="glass-modal w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl border border-slate-100 p-6 sm:p-8">
-        
+
         <div class="flex items-center justify-between mb-4">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-2xl bg-indigo-100 text-indigo-600 flex items-center justify-center">
@@ -2112,22 +2169,22 @@ function renderSupabaseConfigModal() {
         <form id="quick-supabase-form" class="space-y-4">
           <div>
             <label class="block text-xs font-semibold text-slate-700 mb-1">VITE_SUPABASE_URL</label>
-            <input 
-              type="url" 
-              id="quick-supabase-url" 
-              value="${escapeHtml(cfg.url || '')}" 
-              placeholder="https://xxxxxxxx.supabase.co" 
+            <input
+              type="url"
+              id="quick-supabase-url"
+              value="${escapeHtml(cfg.url || '')}"
+              placeholder="https://xxxxxxxx.supabase.co"
               class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
             />
           </div>
 
           <div>
             <label class="block text-xs font-semibold text-slate-700 mb-1">VITE_SUPABASE_ANON_KEY</label>
-            <input 
-              type="text" 
-              id="quick-supabase-key" 
-              value="${escapeHtml(cfg.anonKey || '')}" 
-              placeholder="eyJhbGciOiJIUz..." 
+            <input
+              type="text"
+              id="quick-supabase-key"
+              value="${escapeHtml(cfg.anonKey || '')}"
+              placeholder="eyJhbGciOiJIUz..."
               class="w-full px-3.5 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
             />
           </div>
@@ -2150,8 +2207,9 @@ function renderSupabaseConfigModal() {
     </div>
   `;
 
-  lucide.createIcons();
+  window.lucide?.createIcons();
   bindQuickSupabaseEvents();
+  protectAsyncHandlers(modal);
 }
 
 // ==========================================
@@ -2173,6 +2231,13 @@ function bindGlobalEvents() {
     // 작성 모달 열기 버튼
     const openFormBtn = e.target.closest('#btn-open-form-modal') || e.target.closest('#btn-empty-write');
     if (openFormBtn) {
+      if (state.isSubmitting) return;
+      if (!state.activeTemplate?.is_active || !state.activeTemplate.fields.length || !state.tracks.length || !state.sessions.some(s => s.is_active)) {
+        showToast('error', '진행 중인 차시와 독서일지 양식이 준비되지 않았습니다. 선생님께 문의해 주세요.');
+        return;
+      }
+      state.editingLogId = null;
+      state.pendingSubmissionId = null;
       state.isFormModalOpen = true;
       renderModals();
     }
@@ -2265,20 +2330,26 @@ function bindGlobalEvents() {
   });
 }
 
+const likingLogs = new Set();
 async function handleLikeLog(logId) {
-  const result = await toggleLikeReadingLog(logId);
-  // 로컬 상태 동기화
-  const target = state.logs.find(l => l.id === logId);
-  if (target) {
-    target.likes_count = result.count;
-  }
-  if (state.selectedLog && state.selectedLog.id === logId) {
-    state.selectedLog.likes_count = result.count;
-  }
-  renderFeed();
-  if (state.isDetailModalOpen) {
-    renderDetailModal();
-  }
+  if (likingLogs.has(logId)) return;
+  likingLogs.add(logId);
+  try {
+    const result = await toggleLikeReadingLog(logId);
+    // 로컬 상태 동기화
+    const target = state.logs.find(l => l.id === logId);
+    if (target) {
+      target.likes_count = result.count;
+    }
+    if (state.selectedLog && state.selectedLog.id === logId) {
+      state.selectedLog.likes_count = result.count;
+    }
+    renderFeed();
+    if (state.isDetailModalOpen) {
+      renderDetailModal();
+    }
+  } catch (error) { showToast('error', error.message); }
+  finally { likingLogs.delete(logId); }
 }
 
 function bindFormModalEvents() {
@@ -2287,6 +2358,8 @@ function bindFormModalEvents() {
   const form = document.getElementById('reading-log-form');
 
   const closeModal = () => {
+    if (state.isSubmitting) return;
+    state.pendingSubmissionId = null;
     state.isFormModalOpen = false;
     state.editingLogId = null;
     renderModals();
@@ -2295,35 +2368,27 @@ function bindFormModalEvents() {
   if (closeBtn) closeBtn.onclick = closeModal;
   if (cancelBtn) cancelBtn.onclick = closeModal;
 
-  // 별점 인터랙션 바인딩
-  const starContainer = document.getElementById('star-container');
-  const starInput = document.getElementById('input-star-rating');
-  const starText = document.getElementById('star-rating-text');
-
-  if (starContainer && starInput) {
-    const starLabels = ['', '1점 (다소 아쉬움)', '2점 (보통)', '3점 (유익함)', '4점 (적극 추천)', '5점 (인생의 책)'];
-    starContainer.querySelectorAll('.star-rating-star').forEach(btn => {
+  // 양식에 여러 별점 질문이 있어도 각각 독립적으로 변경한다.
+  form?.querySelectorAll('[data-rating-group]').forEach(group => {
+    const input = group.querySelector('[data-rating-input]');
+    const text = group.querySelector('[data-rating-text]');
+    group.querySelectorAll('[data-star-val]').forEach(btn => {
       btn.onclick = () => {
-        const val = Number(btn.getAttribute('data-star-val'));
-        starInput.value = val;
-        if (starText) starText.textContent = starLabels[val] || `${val}점`;
-        starContainer.querySelectorAll('.star-rating-star').forEach((s, idx) => {
-          if (idx < val) {
-            s.classList.add('text-amber-400');
-            s.classList.remove('text-slate-200');
-          } else {
-            s.classList.remove('text-amber-400');
-            s.classList.add('text-slate-200');
-          }
+        input.value = btn.dataset.starVal;
+        text.textContent = `${input.value}점`;
+        group.querySelectorAll('[data-star-val]').forEach(star => {
+          star.classList.toggle('text-amber-400', Number(star.dataset.starVal) <= Number(input.value));
+          star.classList.toggle('text-slate-200', Number(star.dataset.starVal) > Number(input.value));
         });
       };
     });
-  }
+  });
 
   // 폼 제출 이벤트 (등록 & 수정 공통)
   if (form) {
     form.onsubmit = async e => {
       e.preventDefault();
+      if (state.isSubmitting) return;
 
       const studentId = document.getElementById('form-student-id')?.value.trim();
       const studentName = document.getElementById('form-student-name')?.value.trim();
@@ -2348,11 +2413,22 @@ function bindFormModalEvents() {
         return;
       }
 
+      if (!trackId || !sessionId || !state.tracks.some(t => t.id === trackId)) {
+        showToast('error', '진로 계열과 활동 차시를 선택해 주세요.');
+        return;
+      }
+      if (!isEditing && !state.sessions.some(s => s.id === sessionId && s.is_active)) {
+        showToast('error', '진행 중인 차시를 선택해 주세요.');
+        return;
+      }
+
       // 학생 정보 캐싱
       state.studentCache.student_id = studentId;
       state.studentCache.name = studentName;
-      localStorage.setItem('cached_student_id', studentId);
-      localStorage.setItem('cached_student_name', studentName);
+      try {
+        localStorage.setItem('cached_student_id', studentId);
+        localStorage.setItem('cached_student_name', studentName);
+      } catch { /* 편의 기능의 실패가 서버 제출을 막지 않도록 한다. */ }
 
       // 동적 필드 수집
       const formData = new FormData(form);
@@ -2367,22 +2443,31 @@ function bindFormModalEvents() {
           hasValidationError = true;
           showToast('error', `'${field.label}' 항목은 필수 입력입니다.`);
         }
-        content[field.id] = val ? val.toString().trim() : '';
+        const value = val ? val.toString().trim() : '';
+        if (value && (field.type === 'number' || field.type === 'rating') && !Number.isFinite(Number(value))) {
+          hasValidationError = true;
+          showToast('error', `'${field.label}' 항목에는 숫자를 입력해 주세요.`);
+        }
+        content[field.id] = value;
       });
 
       if (hasValidationError) return;
 
+      state.isSubmitting = true;
       const submitBtn = document.getElementById('btn-submit-log');
+      const submitLabel = submitBtn?.innerHTML;
+      const editingLogId = state.editingLogId;
       if (submitBtn) {
         submitBtn.disabled = true;
         submitBtn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> 저장 중...`;
-        lucide.createIcons();
+        window.lucide?.createIcons();
       }
 
       try {
         if (isEditing) {
           // 수정 모드
-          const existingLog = state.logs.find(l => l.id === state.editingLogId);
+          const existingLog = state.logs.find(l => l.id === editingLogId);
+          if (!existingLog) throw new Error('수정할 일지를 찾을 수 없습니다.');
           let passwordHash = existingLog?.student_info?.password_hash;
           if (pin) {
             passwordHash = await computeSHA256(pin);
@@ -2399,8 +2484,9 @@ function bindFormModalEvents() {
             content: content
           };
 
-          const updated = await updateReadingLog(state.editingLogId, updateData);
-          const idx = state.logs.findIndex(l => l.id === state.editingLogId);
+          const updated = await updateReadingLog(editingLogId, updateData);
+          ++logRefreshVersion;
+          const idx = state.logs.findIndex(l => l.id === editingLogId);
           if (idx !== -1) state.logs[idx] = updated;
           if (state.selectedLog && state.selectedLog.id === state.editingLogId) {
             state.selectedLog = updated;
@@ -2411,11 +2497,14 @@ function bindFormModalEvents() {
           renderModals();
           renderTrackSelector();
           renderFeed();
+          renderStats();
           showToast('success', `🎉 ${studentName} 학생의 독서일지가 성공적으로 수정되었습니다!`);
         } else {
           // 신규 등록 모드
           const pinHash = await computeSHA256(pin);
+          state.pendingSubmissionId ||= generateUUID();
           const logData = {
+            id: state.pendingSubmissionId,
             track_id: trackId,
             session_id: sessionId,
             student_info: {
@@ -2427,12 +2516,15 @@ function bindFormModalEvents() {
           };
 
           const created = await createReadingLog(logData);
-          state.logs = [created, ...state.logs];
+          ++logRefreshVersion;
+          state.logs = [created, ...state.logs.filter(l => l.id !== created.id)];
+          state.pendingSubmissionId = null;
 
           state.isFormModalOpen = false;
           renderModals();
           renderTrackSelector();
           renderFeed();
+          renderStats();
 
           // 성공 폭죽 애니메이션 & 토스트
           triggerConfetti();
@@ -2440,6 +2532,12 @@ function bindFormModalEvents() {
         }
       } catch (err) {
         showToast('error', `일지 저장 중 오류가 발생했습니다: ${err.message}`);
+      } finally {
+        state.isSubmitting = false;
+        if (submitBtn?.isConnected) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = submitLabel;
+        }
       }
     };
   }
@@ -2514,6 +2612,7 @@ function bindDetailModalEvents() {
           renderModals();
           renderTrackSelector();
           renderFeed();
+          renderStats();
           showToast('success', '독서일지가 삭제되었습니다.');
         }
       } else {
@@ -2622,6 +2721,7 @@ function bindAuthPinModalEvents() {
           renderModals();
           renderTrackSelector();
           renderFeed();
+          renderStats();
           showToast('success', '독서일지가 안전하게 삭제되었습니다.');
         }
       }
@@ -2661,7 +2761,7 @@ function bindMoveLogModalEvents() {
       if (submitBtn) {
         submitBtn.disabled = true;
         submitBtn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin inline mr-1"></i> 이동 처리 중...`;
-        lucide.createIcons();
+        window.lucide?.createIcons();
       }
 
       try {
@@ -2715,10 +2815,10 @@ function bindAdminLoginEvents() {
     form.onsubmit = async e => {
       e.preventDefault();
       const pwInput = document.getElementById('admin-password-input')?.value || '';
-      
+
       // SHA-256 단방향 해시 변환 및 검증
       const inputHash = await computeSHA256(pwInput);
-      const targetHash = localStorage.getItem('admin_password_hash') || ADMIN_PASSWORD_HASH;
+      const targetHash = cachedValue('admin_password_hash') || ADMIN_PASSWORD_HASH;
 
       if (inputHash === targetHash) {
         state.isAdmin = true;
@@ -2735,6 +2835,51 @@ function bindAdminLoginEvents() {
 }
 
 function bindAdminModalEvents() {
+  const exportJson = document.getElementById('btn-export-json');
+  const fileInput = document.getElementById('backup-json-file');
+  const importJson = document.getElementById('btn-import-json');
+  const setBackupBusy = busy => {
+    state.backupBusy = busy;
+    if (exportJson) exportJson.disabled = busy;
+    if (fileInput) fileInput.disabled = busy;
+    if (importJson) { importJson.disabled = busy || !state.pendingBackup; importJson.textContent = busy ? '처리 중...' : '확인한 데이터 불러오기'; }
+  };
+  if (exportJson) exportJson.onclick = async () => {
+    if (!state.isAdmin || state.backupBusy) return;
+    setBackupBusy(true);
+    try {
+      const backup = await exportReadingLogBackup();
+      downloadBackup(backup);
+      showToast('success', `전체 독서일지 ${backup.data.reading_logs.length}건을 JSON으로 백업했습니다.`);
+    } finally { setBackupBusy(false); }
+  };
+  if (fileInput) fileInput.onchange = async () => {
+    if (!state.isAdmin || state.backupBusy) return;
+    state.pendingBackup = null;
+    const file = fileInput.files[0];
+    const status = document.getElementById('backup-file-status');
+    if (!file) { setBackupBusy(false); return; }
+    setBackupBusy(true);
+    try {
+      if (file.size > MAX_BACKUP_BYTES) throw new Error('20MB 이하의 JSON 파일을 선택해 주세요.');
+      state.pendingBackup = parseBackupJSON(await file.text());
+      status.textContent = `검증 완료: 독서일지 ${state.pendingBackup.data.reading_logs.length}건 (중복 항목은 건너뜁니다).`;
+    } catch (error) { status.textContent = error.message; throw error; }
+    finally { setBackupBusy(false); }
+  };
+  if (importJson) importJson.onclick = async () => {
+    if (!state.isAdmin || state.backupBusy || !state.pendingBackup) return;
+    if (!confirm(`백업의 독서일지 ${state.pendingBackup.data.reading_logs.length}건을 불러올까요? 기존 데이터는 덮어쓰지 않습니다.`)) return;
+    setBackupBusy(true);
+    try {
+      const result = await importReadingLogBackup(state.pendingBackup);
+      state.pendingBackup = null;
+      await refreshAllData();
+      renderApp();
+      showToast('success', `불러오기 완료: ${result.added}건 추가, 중복 ${result.skipped}건 건너뜀.`);
+    } finally { setBackupBusy(false); renderAdminModal(); }
+  };
+
   const closeBtn = document.getElementById('btn-close-admin-modal');
   const logoutBtn = document.getElementById('btn-admin-logout');
 
@@ -2819,10 +2964,10 @@ function bindAdminModalEvents() {
       if (state.adminLogSearch && state.adminLogSearch.trim()) {
         const q = state.adminLogSearch.toLowerCase().trim();
         filteredLogs = filteredLogs.filter(l => {
-          const book = (l.content?.field_book || '').toLowerCase();
-          const author = (l.content?.field_author || '').toLowerCase();
-          const name = (l.student_info?.name || '').toLowerCase();
-          const studentId = (l.student_info?.student_id || '').toLowerCase();
+          const book = (l.content?.field_book || '').toString().toLowerCase();
+          const author = (l.content?.field_author || '').toString().toLowerCase();
+          const name = (l.student_info?.name || '').toString().toLowerCase();
+          const studentId = (l.student_info?.student_id || '').toString().toLowerCase();
           return book.includes(q) || author.includes(q) || name.includes(q) || studentId.includes(q);
         });
       }
@@ -2852,10 +2997,10 @@ function bindAdminModalEvents() {
       if (state.adminLogSearch && state.adminLogSearch.trim()) {
         const q = state.adminLogSearch.toLowerCase().trim();
         filteredLogs = filteredLogs.filter(l => {
-          const book = (l.content?.field_book || '').toLowerCase();
-          const author = (l.content?.field_author || '').toLowerCase();
-          const name = (l.student_info?.name || '').toLowerCase();
-          const studentId = (l.student_info?.student_id || '').toLowerCase();
+          const book = (l.content?.field_book || '').toString().toLowerCase();
+          const author = (l.content?.field_author || '').toString().toLowerCase();
+          const name = (l.student_info?.name || '').toString().toLowerCase();
+          const studentId = (l.student_info?.student_id || '').toString().toLowerCase();
           return book.includes(q) || author.includes(q) || name.includes(q) || studentId.includes(q);
         });
       }
@@ -3139,7 +3284,7 @@ function bindAdminModalEvents() {
 
       btn.disabled = true;
       btn.innerHTML = `<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin inline mr-1"></i> 저장 중...`;
-      lucide.createIcons();
+      window.lucide?.createIcons();
 
       try {
         const updated = await updateSession(sessId, { title, date });
@@ -3235,6 +3380,7 @@ function bindAdminModalEvents() {
       const url = document.getElementById('admin-supabase-url')?.value.trim();
       const key = document.getElementById('admin-supabase-key')?.value.trim();
       saveSupabaseConfig(url, key);
+      bindRealtime();
       state.supabaseConfig = { url, anonKey: key };
       state.supabaseEditMode = false;
       await checkSupabaseStatus();
@@ -3363,7 +3509,7 @@ export function showToast(type = 'info', message) {
   `;
 
   container.appendChild(toast);
-  lucide.createIcons();
+  window.lucide?.createIcons();
 
   requestAnimationFrame(() => {
     toast.classList.remove('translate-y-3', 'opacity-0');
@@ -3397,7 +3543,37 @@ async function computeSHA256(str) {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   } catch (err) {
     console.error('SHA-256 hash calculation failed:', err);
-    return '';
+    throw new Error('비밀번호 처리에 실패했습니다. HTTPS 또는 localhost 주소로 접속한 뒤 다시 시도해 주세요.');
   }
 }
 
+
+
+/** 비동기 이벤트 오류를 표시하고 중복 클릭을 막는다. */
+function protectAsyncHandlers(root) {
+  if (!root) return;
+  root.querySelectorAll('button, form, input, select').forEach(element => {
+    for (const key of ['onclick', 'onsubmit', 'onchange']) {
+      const handler = element[key];
+      if (!handler || handler.constructor.name !== 'AsyncFunction' || handler.guarded) continue;
+      let running = false;
+      const guarded = async event => {
+        event.preventDefault();
+        if (running) return;
+        running = true;
+        const buttons = element.tagName === 'FORM' ? [...element.querySelectorAll('button[type="submit"]')] : element.tagName === 'BUTTON' ? [element] : [];
+        const originals = buttons.map(button => ({ button, disabled: button.disabled, html: button.innerHTML }));
+        try { await handler.call(element, event); }
+        catch (error) { showToast('error', error.message || '처리 중 오류가 발생했습니다. 다시 시도해 주세요.'); }
+        finally {
+          running = false;
+          for (const { button, disabled, html } of originals) {
+            if (button.isConnected) { button.disabled = disabled; button.innerHTML = html; }
+          }
+        }
+      };
+      guarded.guarded = true;
+      element[key] = guarded;
+    }
+  });
+}

@@ -10,7 +10,7 @@
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
-    tailwind.config = {
+    if (window.tailwind) tailwind.config = {
       theme: {
         extend: {
           colors: {
@@ -91,6 +91,8 @@
   <!-- Main Content Container -->
   <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 w-full flex-1">
     
+    <p id="storage-notice" role="status" class="hidden mb-4 p-4 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-900"></p>
+
     <!-- 1. Career Track Selector -->
     <div id="track-selector-container"></div>
 
@@ -130,8 +132,14 @@
   <script type="module">
     import { initApp } from './js/app.js';
     window.addEventListener('DOMContentLoaded', () => {
-      initApp();
+      initApp().catch(error => {
+        console.error(error);
+        const notice = document.getElementById('storage-notice');
+        notice.textContent = '앱 데이터를 불러오지 못했습니다. 기존 데이터를 삭제하지 말고 새로고침하거나 선생님께 문의해 주세요.';
+        notice.classList.remove('hidden');
+      });
     });
   </script>
 </body>
 </html>
+
